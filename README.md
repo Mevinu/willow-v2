@@ -1,0 +1,1 @@
+My plan is to make something so i can run a good model on my potato PC :P
