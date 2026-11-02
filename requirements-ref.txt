@@ -1,0 +1,6 @@
+# Reference environment for check_qwen35_layers.py (transformers 5.x needs Python 3.10+):
+#   uv venv .venv-ref --python 3.12 && VIRTUAL_ENV=.venv-ref uv pip install -r requirements-ref.txt
+torch
+safetensors
+tokenizers
+transformers>=5
