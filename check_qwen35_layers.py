@@ -14,7 +14,7 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextRotaryEmbedding,
 )
 
-from main import build_index_map
+from expert_pack_compiler import build_index_map
 from engine import load_engine
 
 model_dir = sys.argv[1]

@@ -2,15 +2,17 @@ import os
 import math
 import json
 import time
-import argparse
-from collections import OrderedDict, defaultdict
+import threading
+from collections import OrderedDict, defaultdict, deque
+from concurrent.futures import Future, ThreadPoolExecutor
+from itertools import islice
 
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 from tokenizers import Tokenizer
 
-from main import EXPERT_RE, build_index_map
+from expert_pack_compiler import EXPERT_RE, build_index_map
 
 SAFETENSORS_DTYPES = {
     "F32": torch.float32,
@@ -78,13 +80,15 @@ def compute_inv_freq(cfg: dict, head_dim: int):
 
 class ExpertStore:
     """Reads one expert's [gate | up | down] (or [gate_up | down]) block from the pack with a single aligned read.
+    A layer's experts are read in parallel on a thread pool (os.preadv releases the GIL), so the SSD has many
+    requests in flight and later reads finish while earlier experts are being computed.
     Recently used experts are kept in an LRU cache of up to cache_bytes."""
 
-    def __init__(self, pack_dir: str, cache_bytes: int = 0):
+    def __init__(self, pack_dir: str, cache_bytes: int = 0, read_threads: int = 8, read_ahead: int = 16):
         with open(os.path.join(pack_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
         if "parts" not in self.manifest:
-            raise ValueError(f"{pack_dir} was built by an older main.py; rerun main.py on the model to rebuild it")
+            raise ValueError(f"{pack_dir} was built by an older main.py; rerun `main.py pack` on the model to rebuild it")
         self.fd = os.open(os.path.join(pack_dir, "experts.pack"), os.O_RDONLY)
         self.parts = {
             name: (tuple(info["shape"]), SAFETENSORS_DTYPES[info["dtype"]])
@@ -96,17 +100,37 @@ class ExpertStore:
         self.hits = 0
         self.reads = 0
         self.bytes_read = 0
-        self.read_seconds = 0.0
+        self.read_seconds = 0.0  # wall time with at least one read in flight (not summed per thread)
+        self.pool = ThreadPoolExecutor(read_threads)
+        self.read_ahead = read_ahead  # max experts requested but not yet consumed (bounds memory during prefill)
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.busy_since = 0.0
 
-    def load(self, layer: int, expert: int):
-        """Returns (gate, up, down) weight matrices for one expert, from the cache or the pack."""
-        key = (layer, expert)
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            self.hits += 1
-            return self.cache[key]
+    def load_many(self, layer: int, experts: list):
+        """Yields (expert, (gate, up, down)) in the given order. Reads for up to read_ahead experts are started
+        at once, and each expert is yielded as soon as its own read is done."""
+        def start(expert):
+            key = (layer, expert)
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                self.hits += 1
+                return self.cache[key]
+            return self.pool.submit(self.read, layer, expert)
 
-        weights = self.read(layer, expert)
+        pending = iter(experts)
+        queue = deque((expert, start(expert)) for expert in islice(pending, self.read_ahead))
+        while queue:
+            expert, weights = queue.popleft()
+            following = next(pending, None)
+            if following is not None:
+                queue.append((following, start(following)))
+            if isinstance(weights, Future):
+                weights = weights.result()
+                self.remember((layer, expert), weights)
+            yield expert, weights
+
+    def remember(self, key, weights):
         size = sum(t.numel() * t.element_size() for t in weights)
         if size <= self.cache_bytes:
             while self.cached_bytes + size > self.cache_bytes:
@@ -114,16 +138,28 @@ class ExpertStore:
                 self.cached_bytes -= sum(t.numel() * t.element_size() for t in evicted)
             self.cache[key] = weights
             self.cached_bytes += size
-        return weights
 
     def read(self, layer: int, expert: int):
-        """Reads one expert from the pack."""
+        """Reads one expert from the pack. Runs on the thread pool."""
         entry = self.manifest["experts"][f"{layer}_{expert}"]
-        start = time.perf_counter()
-        block = bytearray(os.pread(self.fd, entry["read_length"], entry["file_offset"]))
-        self.read_seconds += time.perf_counter() - start
-        self.reads += 1
-        self.bytes_read += len(block)
+        block = bytearray(entry["read_length"])
+        with self.lock:
+            if self.in_flight == 0:
+                self.busy_since = time.perf_counter()
+            self.in_flight += 1
+        try:
+            # Reads straight into block (os.pread would return bytes that then need copying)
+            got = os.preadv(self.fd, [block], entry["file_offset"])
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+                if self.in_flight == 0:
+                    self.read_seconds += time.perf_counter() - self.busy_since
+        if got != len(block):
+            raise IOError(f"short read for expert {layer}_{expert}: {got} of {len(block)} bytes")
+        with self.lock:
+            self.reads += 1
+            self.bytes_read += len(block)
 
         weights = {}
         for name, part in entry["parts"].items():
@@ -136,6 +172,7 @@ class ExpertStore:
         return weights["gate"], weights["up"], weights["down"]
 
     def close(self):
+        self.pool.shutdown()
         os.close(self.fd)
 
 class MoEEngine:
@@ -287,16 +324,15 @@ class MoEEngine:
         t = self.tick("router", t)
 
         out = torch.zeros_like(x)
-        # Load each needed expert once, then run every token routed to it
-        for expert in selected.unique().tolist():
-            token_idx, slot = (selected == expert).nonzero(as_tuple=True)
-            t = time.perf_counter()
-            gate_w, up_w, down_w = self.experts.load(layer, expert)
+        # Read all needed experts in parallel, then run every token routed to each one as it arrives.
+        # "expert load" is only the time spent waiting for a read that hasn't finished yet.
+        for expert, (gate_w, up_w, down_w) in self.experts.load_many(layer, selected.unique().tolist()):
             t = self.tick("expert load", t)
+            token_idx, slot = (selected == expert).nonzero(as_tuple=True)
             h = x[token_idx]
             h = F.linear(F.silu(F.linear(h, gate_w)) * F.linear(h, up_w), down_w)
             out.index_add_(0, token_idx, h * routing_weights[token_idx, slot, None])
-            self.tick("expert compute", t)
+            t = self.tick("expert compute", t)
 
         # Shared expert (Qwen2-MoE / Qwen3.5-MoE): a dense MLP every token uses, scaled by a sigmoid gate
         sp = p + ".shared_expert"
@@ -482,28 +518,18 @@ def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = 0) -> Mo
         raise NotImplementedError(f"model_type {model_type!r} is not supported (supported: {', '.join(ENGINES)})")
     return ENGINES[model_type](model_dir, pack_dir, cache_gb)
 
-def main():
-    parser = argparse.ArgumentParser(description="Run a MoE model, streaming experts from its expert pack")
-    parser.add_argument("model_dir", help="Model folder (the one main.py was run on)")
-    parser.add_argument("prompt")
-    parser.add_argument("--max-new-tokens", type=int, default=2048,
-                        help="upper limit; generation stops earlier when the model emits an end token")
-    parser.add_argument("--pack-dir", default=None, help="Default: <model_dir>/expert_pack")
-    parser.add_argument("--think", action="store_true", help="Let chat models think before answering")
-    parser.add_argument("--cache-gb", type=float, default=0.0,
-                        help="RAM for caching recently used experts (default off: on a 16 GB Mac the OS file cache "
-                             "does better, and an explicit cache causes memory pressure)")
-    args = parser.parse_args()
-
+def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir: str = None,
+               think: bool = False, cache_gb: float = 0.0):
+    """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`)."""
     start = time.perf_counter()
-    engine = load_engine(args.model_dir, args.pack_dir, args.cache_gb)
+    engine = load_engine(model_dir, pack_dir, cache_gb)
     load_seconds = time.perf_counter() - start
-    engine.think = args.think
+    engine.think = think
     if isinstance(engine, Qwen35MoEEngine):
-        print(f"> {args.prompt}\n")
+        print(f"> {prompt}\n")
     else:
-        print(args.prompt, end="", flush=True)
-    engine.generate(args.prompt, args.max_new_tokens, stream=True)
+        print(prompt, end="", flush=True)
+    engine.generate(prompt, max_new_tokens, stream=True)
 
     print(f"\n--- stats ---\nload:     {load_seconds:.1f}s")
     for name, s in engine.stats.items():
@@ -518,7 +544,7 @@ def main():
               f"cache hits {hit_rate:3.0f}% | {gib:6.2f} GiB read ({gib / s['tokens']:.2f} GiB/token) | "
               f"disk {io_share:3.0f}% of time at {io_speed:.1f} GiB/s")
     cache = engine.experts
-    print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {args.cache_gb:.2f} GiB used, {len(cache.cache)} experts held")
+    print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache_gb:.2f} GiB used, {len(cache.cache)} experts held")
 
     decode = engine.stats.get("decode")
     if decode and decode["tokens"]:
@@ -526,6 +552,3 @@ def main():
         for section, seconds in sorted(decode["timings"].items(), key=lambda kv: -kv[1]):
             ms = seconds / decode["tokens"] * 1000
             print(f"  {section:18s} {ms:8.1f} ms  ({seconds / decode['seconds'] * 100:4.1f}%)")
-
-if __name__ == "__main__":
-    main()
