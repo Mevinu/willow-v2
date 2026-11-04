@@ -1,11 +1,11 @@
-"""Checks engine.py against Hugging Face transformers on the same model: logits and greedy output must match."""
+"""Checks safetensor/engine.py against Hugging Face transformers on the same model: logits and greedy output must match."""
 import sys
 import argparse
 
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM
 
-from engine import MoEEngine, rope_parameters
+from .engine import load_engine, rope_parameters
 
 def load_reference(model_dir: str):
     config = AutoConfig.from_pretrained(model_dir)
@@ -30,7 +30,7 @@ def main():
     parser.add_argument("--atol", type=float, default=1e-4)
     args = parser.parse_args()
 
-    engine = MoEEngine(args.model_dir)
+    engine = load_engine(args.model_dir)
     reference = load_reference(args.model_dir)
     ok = True
 

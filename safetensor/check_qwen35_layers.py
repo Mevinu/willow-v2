@@ -1,8 +1,8 @@
-"""Compares engine.py's Qwen3.5 decoder layers against transformers' own layer classes, using the real
+"""Compares safetensor/engine.py's Qwen3.5 decoder layers against transformers' own layer classes, using the real
 Qwen3.6-35B-A3B weights one layer at a time (the whole model does not fit in 16 GB).
 Needs transformers 5.x, so run it with .venv-ref (see requirements-ref.txt):
 
-    .venv-ref/bin/python check_qwen35_layers.py /path/to/Qwen3.6-35B-A3B 0 3 39
+    .venv-ref/bin/python -m safetensor.check_qwen35_layers /path/to/Qwen3.6-35B-A3B 0 3 39
 
 Expect cosine ~0.9995+ in bf16; a real bug shows up as cosine far below 0.99.
 """
@@ -14,8 +14,8 @@ from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeDecoderLayer, Qwen3_5MoeTextRotaryEmbedding,
 )
 
-from expert_pack_compiler import build_index_map
-from engine import load_engine
+from .compiler import build_index_map
+from .engine import load_engine
 
 model_dir = sys.argv[1]
 layers = [int(x) for x in sys.argv[2:]] or [0, 3]

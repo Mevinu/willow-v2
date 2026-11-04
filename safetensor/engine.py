@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from tokenizers import Tokenizer
 
-from expert_pack_compiler import EXPERT_RE, build_index_map
+from .compiler import EXPERT_RE, build_index_map
 
 SAFETENSORS_DTYPES = {
     "F32": torch.float32,
@@ -84,16 +84,18 @@ class ExpertStore:
     requests in flight and later reads finish while earlier experts are being computed.
     Recently used experts are kept in an LRU cache of up to cache_bytes."""
 
+    pack_format = "safetensors"  # the manifest's "format"; packs from before the field existed are safetensors
+
     def __init__(self, pack_dir: str, cache_bytes: int = 0, read_threads: int = 8, read_ahead: int = 16):
         with open(os.path.join(pack_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
         if "parts" not in self.manifest:
             raise ValueError(f"{pack_dir} was built by an older main.py; rerun `main.py pack` on the model to rebuild it")
+        if self.manifest.get("format", "safetensors") != self.pack_format:
+            raise ValueError(f"{pack_dir} is a {self.manifest.get('format', 'safetensors')} pack, "
+                             f"but the model is {self.pack_format}; rerun `main.py pack` on this model")
         self.fd = os.open(os.path.join(pack_dir, "experts.pack"), os.O_RDONLY)
-        self.parts = {
-            name: (tuple(info["shape"]), SAFETENSORS_DTYPES[info["dtype"]])
-            for name, info in self.manifest["parts"].items()
-        }
+        self.parts = {name: (tuple(info["shape"]), info["dtype"]) for name, info in self.manifest["parts"].items()}
         self.cache = OrderedDict()  # (layer, expert) -> (gate, up, down), least recently used first
         self.cache_bytes = cache_bytes
         self.cached_bytes = 0
@@ -161,15 +163,17 @@ class ExpertStore:
             self.reads += 1
             self.bytes_read += len(block)
 
-        weights = {}
-        for name, part in entry["parts"].items():
-            shape, dtype = self.parts[name]
-            tensor = torch.frombuffer(block, dtype=dtype, count=math.prod(shape), offset=part["offset"])
-            weights[name] = tensor.view(shape)
+        weights = {name: self.part_tensor(block, layer, name, part) for name, part in entry["parts"].items()}
         if "gate_up" in weights:
             # Fused [2 * intermediate, hidden]: gate rows first, then up rows
             weights["gate"], weights["up"] = weights.pop("gate_up").chunk(2, dim=0)
         return weights["gate"], weights["up"], weights["down"]
+
+    def part_tensor(self, block: bytearray, layer: int, name: str, part: dict) -> torch.Tensor:
+        """Turns one part's bytes inside a read block into a weight tensor (no copy: it views the block)."""
+        shape, dtype = self.parts[name]
+        tensor = torch.frombuffer(block, dtype=SAFETENSORS_DTYPES[dtype], count=math.prod(shape), offset=part["offset"])
+        return tensor.view(shape)
 
     def close(self):
         self.pool.shutdown()
@@ -181,38 +185,17 @@ class MoEEngine:
     prefix = "model."            # where the decoder's weights live in the checkpoint
     zero_centered_norm = False   # RMSNorm scales by (1 + w) instead of w
 
-    def __init__(self, model_dir: str, pack_dir: str = None, cache_gb: float = 0):
-        with open(os.path.join(model_dir, "config.json")) as f:
-            full_cfg = json.load(f)
-        cfg = full_cfg.get("text_config", full_cfg)
+    def __init__(self, cfg: dict, eos_ids: set, weights: dict, experts: ExpertStore, tokenizer: Tokenizer):
+        """cfg is the (text) config.json, and weights maps Hugging Face tensor names to every non-expert tensor.
+        load_engine builds these from a safetensors folder, gguf.engine.load_engine from a .gguf file."""
         self.cfg = cfg
         self.setup(cfg)
-
-        eos = cfg.get("eos_token_id")
-        gen_cfg_path = os.path.join(model_dir, "generation_config.json")
-        if os.path.exists(gen_cfg_path):
-            with open(gen_cfg_path) as f:
-                eos = json.load(f).get("eos_token_id", eos)
-        self.eos_ids = set(eos if isinstance(eos, list) else [eos])
-
-        # Everything except the routed experts stays resident in RAM. get_tensor only memory-maps the shard,
-        # so clone() to really load it: otherwise macOS drops the pages under memory pressure and silently
-        # re-reads them from disk on every token. The one exception is the embedding table when lm_head is
-        # separate: each token reads a single row of it, so leaving it memory-mapped saves ~1 GB for free.
-        index_map = build_index_map(model_dir)
-        lazy = {self.prefix + "embed_tokens.weight"} if "lm_head.weight" in index_map else set()
-        self.weights = {}
-        for shard in sorted(set(index_map.values())):
-            with safe_open(shard, framework="pt", device="cpu") as f:
-                for name in f.keys():
-                    if not EXPERT_RE.match(name) and not name.startswith(SKIP_PREFIXES):
-                        tensor = f.get_tensor(name)
-                        self.weights[name] = tensor if name in lazy else tensor.clone()
+        self.eos_ids = eos_ids
+        self.weights = weights
         if "lm_head.weight" not in self.weights:
             self.weights["lm_head.weight"] = self.weights[self.prefix + "embed_tokens.weight"]
-
-        self.experts = ExpertStore(pack_dir or os.path.join(model_dir, "expert_pack"), int(cache_gb * 1024**3))
-        self.tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+        self.experts = experts
+        self.tokenizer = tokenizer
         self.reset()
 
     def setup(self, cfg: dict):
@@ -513,16 +496,44 @@ ENGINES = {"qwen3_moe": MoEEngine, "qwen3_5_moe": Qwen35MoEEngine}
 
 def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = 0) -> MoEEngine:
     with open(os.path.join(model_dir, "config.json")) as f:
-        model_type = json.load(f).get("model_type")
+        full_cfg = json.load(f)
+    model_type = full_cfg.get("model_type")
     if model_type not in ENGINES:
         raise NotImplementedError(f"model_type {model_type!r} is not supported (supported: {', '.join(ENGINES)})")
-    return ENGINES[model_type](model_dir, pack_dir, cache_gb)
+    engine_class = ENGINES[model_type]
+    cfg = full_cfg.get("text_config", full_cfg)
+
+    eos = cfg.get("eos_token_id")
+    gen_cfg_path = os.path.join(model_dir, "generation_config.json")
+    if os.path.exists(gen_cfg_path):
+        with open(gen_cfg_path) as f:
+            eos = json.load(f).get("eos_token_id", eos)
+    eos_ids = set(eos if isinstance(eos, list) else [eos])
+
+    # Everything except the routed experts stays resident in RAM. get_tensor only memory-maps the shard,
+    # so clone() to really load it: otherwise macOS drops the pages under memory pressure and silently
+    # re-reads them from disk on every token. The one exception is the embedding table when lm_head is
+    # separate: each token reads a single row of it, so leaving it memory-mapped saves ~1 GB for free.
+    index_map = build_index_map(model_dir)
+    lazy = {engine_class.prefix + "embed_tokens.weight"} if "lm_head.weight" in index_map else set()
+    weights = {}
+    for shard in sorted(set(index_map.values())):
+        with safe_open(shard, framework="pt", device="cpu") as f:
+            for name in f.keys():
+                if not EXPERT_RE.match(name) and not name.startswith(SKIP_PREFIXES):
+                    tensor = f.get_tensor(name)
+                    weights[name] = tensor if name in lazy else tensor.clone()
+
+    experts = ExpertStore(pack_dir or os.path.join(model_dir, "expert_pack"), int(cache_gb * 1024**3))
+    tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
+    return engine_class(cfg, eos_ids, weights, experts, tokenizer)
 
 def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir: str = None,
-               think: bool = False, cache_gb: float = 0.0):
-    """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`)."""
+               think: bool = False, cache_gb: float = 0.0, load=load_engine):
+    """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`).
+    load builds the engine from model_dir: load_engine here, gguf.engine.load_engine for .gguf files."""
     start = time.perf_counter()
-    engine = load_engine(model_dir, pack_dir, cache_gb)
+    engine = load(model_dir, pack_dir, cache_gb)
     load_seconds = time.perf_counter() - start
     engine.think = think
     if isinstance(engine, Qwen35MoEEngine):

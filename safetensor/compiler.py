@@ -116,7 +116,8 @@ def build_expert_pack(
     output_manifest_path: str,
     num_layers: int,
     num_experts: int,
-    expert_stride: int
+    expert_stride: int,
+    pack_format: str = "safetensors"
 ):
     """
     Reorganizes scattered MoE expert tensors into a single contiguous,
@@ -125,9 +126,11 @@ def build_expert_pack(
     expert_plan maps (layer, expert) -> [(part_name, shard_path, byte_offset, byte_size), ...]
     giving the raw bytes of each part (e.g. gate/up/down) inside the source safetensors shards.
     part_info maps part_name -> {"shape": [...], "dtype": "BF16"} and is copied into the manifest.
+    pack_format records where the bytes came from ("safetensors" or "gguf"), so engines can refuse the other kind.
     """
     expert_stride = align_up(expert_stride, PAGE_ALIGNMENT)
     manifest = {
+        "format": pack_format,
         "alignment": PAGE_ALIGNMENT,
         "data_start": 0,
         "num_layers": num_layers,
