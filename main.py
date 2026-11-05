@@ -27,6 +27,12 @@ def main():
     run.add_argument("--preload", action=argparse.BooleanOptionalAction, default=True,
                      help="For .gguf: read each layer's most used 15%% of experts (from earlier runs) into the "
                           "cache before generating (needs --cache-gb)")
+    run.add_argument("--gpu-backbone", action=argparse.BooleanOptionalAction, default=True,
+                     help="For .gguf with a GPU pack: also run attention, the router, the shared expert and the output "
+                          "layer on the GPU (default: on; --no-gpu-backbone keeps them on the CPU)")
+    run.add_argument("--sync-timings", action="store_true",
+                     help="Wait for the GPU at each section boundary, so 'decode time per token, by section' shows "
+                          "where GPU time goes (slower; without it, GPU work is counted wherever the CPU next waits)")
     pack.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=None,
                       help="For .gguf: store the int4 experts in the GPU (MPS) kernel's format so they run on the "
                            "GPU (default: on when torch can use MPS; --no-gpu keeps them on the CPU)")
@@ -45,7 +51,8 @@ def main():
         if is_gguf(args.model):
             from functools import partial
             from gguf.engine import load_engine
-            load_engine = partial(load_engine, preload=args.preload)
+            load_engine = partial(load_engine, preload=args.preload, gpu_backbone=args.gpu_backbone,
+                                  sync_timings=args.sync_timings)
         else:
             from safetensor.engine import load_engine
         run_prompt(args.model, args.prompt, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb, load_engine)

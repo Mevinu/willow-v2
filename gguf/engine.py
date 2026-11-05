@@ -81,7 +81,8 @@ class GGUFExpertStore(ExpertStore):
     CPU and GPU share (see mps_shared), so an expert is read from the SSD straight into memory the GPU computes
     from, with no copy. They always exist (with --cache-gb 0, just enough slots to read into, in GPU_SLAB_MIN), and
     the GPU runs behind the CPU, so a slot handed out for the current layer isn't refilled until load_many starts
-    the next layer: by then the last layer's output has been copied back, which waits for the GPU."""
+    the next layer: before that, MoEEngine.moe copies the next layer's expert choices back to the CPU, which waits
+    for all queued GPU work."""
 
     pack_format = "gguf"
     # Always start the next layer's guessed reads. A GGUF expert is small (~2 MiB), so the guesses queue behind
@@ -537,9 +538,12 @@ def build_tokenizer(metadata: dict) -> Tokenizer:
                           for i, kind in enumerate(types) if kind == USER_DEFINED_TOKEN])
     return tokenizer
 
-def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, preload: bool = True) -> MoEEngine:
+def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, preload: bool = True,
+                gpu_backbone: bool = True, sync_timings: bool = False) -> MoEEngine:
     """cache_gb None or 0 (no --cache-gb) turns the expert cache off. preload reads the most used experts into
-    the cache first (see GGUFExpertStore.preload)."""
+    the cache first (see GGUFExpertStore.preload). With a GPU pack, gpu_backbone also runs everything else
+    (attention, the router, the shared expert, the output layer) on the GPU. sync_timings makes the per-section
+    decode times real when the GPU is used, at some cost in speed (see MoEEngine.tick)."""
     metadata, tensors = read_gguf(gguf_path)
     arch = metadata.get("general.architecture")
     if arch not in ENGINES:
@@ -557,4 +561,8 @@ def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, pr
     experts = GGUFExpertStore(pack_dir or default_pack_dir(gguf_path), int((cache_gb or 0) * 1024**3))
     if preload:
         experts.preload()
-    return engine_class(cfg, eos_ids, weights, experts, tokenizer)
+    device = "mps" if experts.gpu and gpu_backbone else "cpu"
+    engine = engine_class(cfg, eos_ids, weights, experts, tokenizer, device)
+    engine.sync_timings = sync_timings
+    print(f"experts on the {'GPU' if experts.gpu else 'CPU'}, the rest on the {'GPU' if device == 'mps' else 'CPU'}")
+    return engine

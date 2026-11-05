@@ -30,6 +30,102 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return x * torch.rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
 
+# The small steps of each layer, as plain functions of tensors. On the GPU each op costs ~0.01-0.02 ms to issue
+# however small it is, and a layer has ~100 of them, so there they are compiled with torch.compile, which fuses
+# each into a few GPU kernels (see Ops). On the CPU they run as they are.
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float, zero_centered: bool) -> torch.Tensor:
+    x32 = x.float()
+    x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    if zero_centered:
+        return (x32 * (1.0 + weight.float())).type_as(x)
+    return weight * x32.to(x.dtype)
+
+def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rotary_dim: int) -> torch.Tensor:
+    # Only the first rotary_dim dims of each head are rotated (partial RoPE); the rest pass through
+    x_rot, x_pass = x[..., :rotary_dim], x[..., rotary_dim:]
+    cos, sin = cos.to(x.dtype), sin.to(x.dtype)
+    return torch.cat((x_rot * cos + rotate_half(x_rot) * sin, x_pass), dim=-1)
+
+def attention_core(q, k, v, mask, gate, groups: int, scale: float) -> torch.Tensor:
+    """q [heads, seq, dim], k and v [kv_heads, capacity, dim], mask [seq, capacity] -> [seq, heads * dim]."""
+    # Grouped-query attention: each KV head serves num_heads / num_kv_heads query heads
+    k = k.repeat_interleave(groups, dim=0)
+    v = v.repeat_interleave(groups, dim=0)
+    scores = (q @ k.transpose(1, 2)) * scale + mask
+    probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    out = (probs @ v).transpose(0, 1).reshape(q.shape[1], q.shape[0] * q.shape[2])
+    if gate is not None:
+        out = out * torch.sigmoid(gate)
+    return out
+
+def route(router_logits: torch.Tensor, top_k: int, normalize: bool):
+    """-> (routing weights [tokens, top_k] in router_logits' dtype, selected experts [tokens, top_k])"""
+    routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
+    routing_weights, selected = torch.topk(routing_weights, top_k, dim=-1)
+    if normalize:
+        routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+    return routing_weights.to(router_logits.dtype), selected
+
+def shared_expert(x, gate_w, up_w, down_w, shared_gate_w) -> torch.Tensor:
+    """Qwen2-MoE / Qwen3.5-MoE: a dense MLP every token uses, scaled by a sigmoid gate."""
+    h = F.linear(F.silu(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
+    return torch.sigmoid(F.linear(x, shared_gate_w)) * h
+
+def linear_attention_step(mixed, z, b, a, conv_state, conv_w, A_log, dt_bias, norm_w, state,
+                          k_heads: int, v_heads: int, k_dim: int, v_dim: int, eps: float):
+    """One decode token of Gated DeltaNet, after its input projections: the same as Qwen35MoEEngine's
+    linear_attention + gated_delta_rule for seq_len 1. Returns (output [1, v_heads * v_dim] for out_proj,
+    new conv state, new recurrent state)."""
+    key_dim = k_heads * k_dim
+    window = torch.cat((conv_state, mixed))  # [kernel, channels]
+    conv = (window.float() * conv_w[:, 0, :].float().t()).sum(0, keepdim=True)
+    mixed_act = F.silu(conv.to(mixed.dtype))
+    q, k, v = mixed_act.split([key_dim, key_dim, v_heads * v_dim], dim=-1)
+    q, k, v = q.reshape(k_heads, k_dim), k.reshape(k_heads, k_dim), v.reshape(v_heads, v_dim)
+    if v_heads > k_heads:
+        q = q.repeat_interleave(v_heads // k_heads, dim=0)
+        k = k.repeat_interleave(v_heads // k_heads, dim=0)
+    beta = b[0].sigmoid().float()
+    decay = -A_log.float().exp() * F.softplus(a[0].float() + dt_bias)
+    q = l2norm(q.float()) * k_dim ** -0.5
+    k = l2norm(k.float())
+    state = state * decay.exp()[:, None, None]
+    predicted = torch.einsum("hkv,hk->hv", state, k)
+    delta = (v.float() - predicted) * beta[:, None]
+    state = state + k[:, :, None] * delta[:, None, :]
+    out = torch.einsum("hkv,hk->hv", state, q).to(mixed.dtype)
+    # Gated RMSNorm per head: norm(out) * w * silu(z)
+    o32 = out.float()
+    o32 = o32 * torch.rsqrt(o32.pow(2).mean(-1, keepdim=True) + eps)
+    out = (norm_w * o32.to(out.dtype) * F.silu(z.view(v_heads, v_dim).float())).to(out.dtype)
+    return out.reshape(1, v_heads * v_dim), window[1:], state
+
+class Ops:
+    """The functions above, run as they are, or (with compile set, for the GPU) compiled with torch.compile while
+    decoding. Compiled for fixed shapes only (torch 2.8's GPU compiler fails on shapes that vary), so a prefill
+    batch, whose length varies, runs them as they are; decode steps all have the same shapes (the KV cache grows
+    in KV_BLOCK steps, each compiled once)."""
+    NAMES = ("rms_norm", "apply_rope", "attention_core", "route", "shared_expert", "linear_attention_step")
+
+    def __init__(self, compile: bool):
+        self.compiled = compile
+        self.decoding = False  # set by MoEEngine.forward: compiled versions are used only while this is True
+        if compile:
+            import logging
+            import torch._dynamo
+            # Hides inductor's "Not enough SMs to use max_autotune_gemm mode" warning (harmless; it's about CUDA)
+            logging.getLogger("torch._inductor.utils").setLevel(logging.ERROR)
+            for limit in ("recompile_limit", "cache_size_limit"):  # one compile per KV-cache size, at most
+                if hasattr(torch._dynamo.config, limit):
+                    setattr(torch._dynamo.config, limit, 64)
+        for name in self.NAMES:
+            fn = globals()[name]
+            setattr(self, name, self.dispatch(fn, torch.compile(fn, dynamic=False)) if compile else fn)
+
+    def dispatch(self, eager, compiled):
+        return lambda *args: (compiled if self.decoding else eager)(*args)
+
 def rope_parameters(cfg: dict) -> dict:
     # transformers 5.x saves "rope_parameters" (with rope_theta inside), 4.x saves "rope_theta" + "rope_scaling"
     params = dict(cfg.get("rope_parameters") or cfg.get("rope_scaling") or {})
@@ -79,6 +175,10 @@ def compute_inv_freq(cfg: dict, head_dim: int):
     return inv_freq, attention_factor
 
 PREFETCH_MAX_IN_FLIGHT = 4  # default ExpertStore.prefetch_max_in_flight
+# The KV cache grows in steps of this many positions, and attention always runs over the whole allocated length
+# (the unused end masked off). On the GPU every new tensor shape costs a fresh setup of each op (~11 ms per
+# attention layer when the cache grew by one position per token), so the shapes only change every KV_BLOCK tokens.
+KV_BLOCK = 256
 
 def expert_weights(parts: dict) -> tuple:
     """An expert's parts by name -> (gate_up, down) when gate and up are fused into one
@@ -282,14 +382,29 @@ class MoEEngine:
 
     prefix = "model."            # where the decoder's weights live in the checkpoint
     zero_centered_norm = False   # RMSNorm scales by (1 + w) instead of w
-    prefetch_top_k = 4           # next-layer experts to start reading early while decoding (0: off)
+    prefetch_top_k = 8           # next-layer experts to start reading early while decoding (0: off)
 
-    def __init__(self, cfg: dict, eos_ids: set, weights: dict, experts: ExpertStore, tokenizer: Tokenizer):
+    def __init__(self, cfg: dict, eos_ids: set, weights: dict, experts: ExpertStore, tokenizer: Tokenizer,
+                 device: str = "cpu"):
         """cfg is the (text) config.json, and weights maps Hugging Face tensor names to every non-expert tensor.
-        load_engine builds these from a safetensors folder, gguf.engine.load_engine from a .gguf file."""
+        load_engine builds these from a safetensors folder, gguf.engine.load_engine from a .gguf file.
+        device runs everything except the experts there (the experts run where their weights are): "mps" moves
+        the non-expert weights to the GPU, freeing their CPU copies, and keeps the hidden state there."""
         self.cfg = cfg
         self.setup(cfg)
         self.eos_ids = eos_ids
+        self.device = torch.device(device)
+        self.ops = Ops(compile=self.device.type == "mps")
+        self.sync_timings = False  # wait for the GPU at every section boundary, so the per-section times are real
+        self.keep_alive = []       # CPU sources of non-blocking GPU copies, kept until the GPU has run them
+        if self.device.type != "cpu":
+            moved = {}  # tied tensors (lm_head = embed_tokens) are moved once
+            for name in list(weights):
+                tensor = weights[name]
+                if id(tensor) not in moved:
+                    moved[id(tensor)] = tensor.to(self.device)
+                weights[name] = moved[id(tensor)]
+            del moved, tensor
         self.weights = weights
         if "lm_head.weight" not in self.weights:
             self.weights["lm_head.weight"] = self.weights[self.prefix + "embed_tokens.weight"]
@@ -315,7 +430,8 @@ class MoEEngine:
         self.inv_freq, self.attention_factor = compute_inv_freq(cfg, self.rotary_dim)
 
     def reset(self):
-        self.kv_cache = [None] * self.num_layers
+        self.kv_cache = [None] * self.num_layers  # per layer: (keys, values), each [kv_heads, capacity, head_dim]
+        self.mask_key = None
         self.position = 0
         self.timings = defaultdict(float)
 
@@ -326,24 +442,24 @@ class MoEEngine:
         return F.linear(x, self.w(prefix + ".weight"), self.weights.get(prefix + ".bias"))
 
     def rms_norm(self, x: torch.Tensor, weight_name: str) -> torch.Tensor:
-        weight = self.w(weight_name)
-        x32 = x.float()
-        x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + self.eps)
-        if self.zero_centered_norm:
-            return (x32 * (1.0 + weight.float())).type_as(x)
-        return weight * x32.to(x.dtype)
+        return self.ops.rms_norm(x, self.w(weight_name), self.eps, self.zero_centered_norm)
 
     def rope(self, seq_len: int):
         positions = torch.arange(self.position, self.position + seq_len, dtype=torch.float32)
         freqs = torch.outer(positions, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
-        return emb.cos() * self.attention_factor, emb.sin() * self.attention_factor
+        return self.to_device(emb.cos() * self.attention_factor), self.to_device(emb.sin() * self.attention_factor)
+
+    def to_device(self, t: torch.Tensor) -> torch.Tensor:
+        """Copies a CPU tensor to self.device without waiting (a waiting copy to the GPU waits for all queued GPU
+        work), keeping the source alive until the GPU's next wait."""
+        if self.device.type == "cpu":
+            return t
+        self.keep_alive.append(t)
+        return t.to(self.device, non_blocking=True)
 
     def apply_rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        # Only the first rotary_dim dims of each head are rotated (partial RoPE); the rest pass through
-        x_rot, x_pass = x[..., :self.rotary_dim], x[..., self.rotary_dim:]
-        cos, sin = cos.to(x.dtype), sin.to(x.dtype)
-        return torch.cat((x_rot * cos + rotate_half(x_rot) * sin, x_pass), dim=-1)
+        return self.ops.apply_rope(x, cos, sin, self.rotary_dim)
 
     def attention(self, x: torch.Tensor, layer: int, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         p = f"{self.prefix}layers.{layer}.self_attn"
@@ -365,87 +481,105 @@ class MoEEngine:
         q = self.apply_rope(q, cos, sin)
         k = self.apply_rope(k, cos, sin)
 
-        if self.kv_cache[layer] is not None:
-            past_k, past_v = self.kv_cache[layer]
-            k, v = torch.cat((past_k, k), dim=1), torch.cat((past_v, v), dim=1)
-        self.kv_cache[layer] = (k, v)
-
-        # Grouped-query attention: each KV head serves num_heads / num_kv_heads query heads
-        groups = self.num_heads // self.num_kv_heads
-        k = k.repeat_interleave(groups, dim=0)
-        v = v.repeat_interleave(groups, dim=0)
-
-        scores = (q @ k.transpose(1, 2)) * self.head_dim ** -0.5
-        total_len = k.shape[1]
-        causal = torch.ones(seq_len, total_len, dtype=torch.bool).tril(total_len - seq_len)
-        scores = scores.masked_fill(~causal, float("-inf"))
-        probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = (probs @ v).transpose(0, 1).reshape(seq_len, self.num_heads * self.head_dim)
-        if gate is not None:
-            out = out * torch.sigmoid(gate)
+        # Write this step's keys and values into the cache (positions self.position on), growing it by whole blocks
+        end = self.position + seq_len
+        cache = self.kv_cache[layer]
+        if cache is None or cache[0].shape[1] < end:
+            capacity = -(-end // KV_BLOCK) * KV_BLOCK
+            grown = tuple(k.new_zeros(self.num_kv_heads, capacity, self.head_dim) for _ in range(2))
+            if cache is not None:
+                for new, old in zip(grown, cache):
+                    new[:, :self.position] = old[:, :self.position]
+            cache = self.kv_cache[layer] = grown
+        cache[0][:, self.position:end] = k
+        cache[1][:, self.position:end] = v
+        k, v = cache
+        out = self.ops.attention_core(q, k, v, self.attention_mask(seq_len, k.shape[1]), gate,
+                                      self.num_heads // self.num_kv_heads, self.head_dim ** -0.5)
         return self.linear(out, p + ".o_proj")
+
+    def attention_mask(self, seq_len: int, capacity: int) -> torch.Tensor:
+        """[seq_len, capacity] float32, 0 where query i (at position self.position + i) may attend to key j, else
+        -inf: causal, and nothing past the keys written so far. The same for every attention layer in a forward
+        pass, so it's built once (on the CPU, so no GPU op is set up per position) and copied without waiting."""
+        key = (self.position, seq_len, capacity)
+        if self.mask_key != key:
+            limit = torch.arange(self.position, self.position + seq_len)[:, None]
+            mask = torch.zeros(seq_len, capacity).masked_fill(torch.arange(capacity)[None, :] > limit, float("-inf"))
+            self.keep_alive.append(mask)
+            self.mask, self.mask_key = mask.to(self.device, non_blocking=self.device.type != "cpu"), key
+        return self.mask
 
     def token_mixer(self, x: torch.Tensor, layer: int, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return self.attention(x, layer, cos, sin)
 
     def tick(self, section: str, since: float) -> float:
         """Adds the time since `since` to a section's total; returns now, so calls can be chained."""
+        if self.sync_timings and self.device.type == "mps":
+            torch.mps.synchronize()
         now = time.perf_counter()
         self.timings[section] += now - since
         return now
 
-    def prefetch_next_layer(self, residual: torch.Tensor, layer: int):
+    def guess_next_layer(self, residual: torch.Tensor, layer: int):
         """Guesses the next layer's experts by running its router on the current residual stream (it hasn't
         been through this layer's experts or the next layer's attention yet, but usually picks many of the
-        same experts), and starts reading them so the SSD works while this layer and the next attention run.
-        Decode only: a prefill batch reads most experts anyway."""
+        same experts), so moe can start reading them while this layer and the next attention run. Returns
+        their ids as a tensor (on the engine's device), or None. Decode only: a prefill batch reads most
+        experts anyway."""
         following = layer + 1
-        if not self.prefetch_top_k or following >= self.num_layers or residual.shape[0] != 1:
-            return
-        t = time.perf_counter()
+        if residual is None or not self.prefetch_top_k or following >= self.num_layers or residual.shape[0] != 1:
+            return None
         p = f"{self.prefix}layers.{following}"
         logits = self.linear(self.rms_norm(residual, p + ".post_attention_layernorm.weight"), p + ".mlp.gate")
-        self.experts.prefetch(following, logits[0].topk(self.prefetch_top_k).indices.tolist())
-        self.tick("prefetch", t)
+        return logits[0].topk(self.prefetch_top_k).indices
 
     def moe(self, x: torch.Tensor, layer: int, residual: torch.Tensor = None) -> torch.Tensor:
         p = f"{self.prefix}layers.{layer}.mlp"
         t = time.perf_counter()
-        router_logits = self.linear(x, p + ".gate")
-        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        routing_weights, selected = torch.topk(routing_weights, self.top_k, dim=-1)
-        if self.norm_topk_prob:
-            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
-        routing_weights = routing_weights.to(x.dtype)
+        routing_weights, selected = self.ops.route(self.linear(x, p + ".gate"), self.top_k, self.norm_topk_prob)
+        t = self.tick("router", t)
+        guess = self.guess_next_layer(residual, layer)
+        t = self.tick("prefetch", t)
+        # Which experts each token picked (and the guesses) are needed on the CPU: to read them, and to index
+        # with (nonzero on the GPU waits for it every time), so both come back in one copy. On the GPU it's the
+        # layer's one wait for all queued GPU work, so after it the GPU has run every earlier copy, and the
+        # expert slots it read are free to refill.
+        if guess is None:
+            selected = selected.cpu()
+        else:
+            both = torch.cat((selected.flatten(), guess)).cpu()
+            selected, guess = both[:selected.numel()].view(selected.shape), both[selected.numel():].tolist()
+        self.keep_alive = []
         self.experts.record_usage(layer, selected)
         # Start this layer's reads first, so the guesses for the next layer queue up behind them
         loads = self.experts.load_many(layer, selected.unique().tolist())
+        if guess is not None:
+            self.experts.prefetch(layer + 1, guess)
         t = self.tick("router", t)
-        if residual is not None:
-            self.prefetch_next_layer(residual, layer)
-            t = time.perf_counter()
 
         # Run every token routed to each expert as it arrives (cache hits first, then reads as they finish).
         # "expert load" is only the time spent waiting for a read that hasn't finished yet.
         # An expert whose weights are all on the GPU (a GGUF pack built with --gpu) is computed there, and its
         # output stays there until the layer's sum is copied back once, so the CPU doesn't wait on every expert.
         # Copies to the GPU don't wait (a waiting copy waits for all queued GPU work: ~0.2 ms each), so their CPU
-        # sources are kept in `uploads` until the blocking copy back at the end, by which time they have all run.
-        results, uploads, on_device = [], [], {}
+        # sources are kept in self.keep_alive until the GPU's next wait (the copy back below, or the next layer's
+        # `selected.cpu()`), by which time they have all run.
+        results, on_device = [], {x.device: (x, routing_weights)}
         for expert, weights in loads:
             t = self.tick("expert load", t)
             token_idx, slot = (selected == expert).nonzero(as_tuple=True)
             device = weights[0].device if all(w.device == weights[0].device for w in weights) else x.device
-            if device == x.device:
-                h, scale = x[token_idx], routing_weights[token_idx, slot, None]
-            else:
-                if device not in on_device:  # this layer's input and routing weights, copied once
-                    on_device[device] = (x.to(device, non_blocking=True), routing_weights.to(device, non_blocking=True))
+            if device not in on_device:  # this layer's input and routing weights, copied there once
+                gpu = device.type != "cpu"
+                on_device[device] = (x.to(device, non_blocking=gpu), routing_weights.to(device, non_blocking=gpu))
+                self.keep_alive.append(on_device[x.device])
+            if device.type != "cpu":
                 index = torch.stack((token_idx, slot))
-                uploads.append(index)
+                self.keep_alive.append(index)
                 token_idx, slot = index.to(device, non_blocking=True)
-                x_dev, weights_dev = on_device[device]
-                h, scale = x_dev[token_idx], weights_dev[token_idx, slot, None]
+            x_dev, weights_dev = on_device[device]
+            h, scale = x_dev[token_idx], weights_dev[token_idx, slot, None]
             if len(weights) == 2:  # fused gate_up: one matmul, then split its output
                 gate, up = F.linear(h, weights[0]).chunk(2, dim=-1)
             else:
@@ -465,19 +599,19 @@ class MoEEngine:
             out += total.to(x.device)
         self.tick("expert compute", t)
 
-        # Shared expert (Qwen2-MoE / Qwen3.5-MoE): a dense MLP every token uses, scaled by a sigmoid gate
         sp = p + ".shared_expert"
         if sp + ".gate_proj.weight" in self.weights:
             t = time.perf_counter()
-            shared = self.linear(F.silu(self.linear(x, sp + ".gate_proj")) * self.linear(x, sp + ".up_proj"), sp + ".down_proj")
-            out = out + torch.sigmoid(self.linear(x, p + ".shared_expert_gate")) * shared
+            out = out + self.ops.shared_expert(x, self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"),
+                                               self.w(sp + ".down_proj.weight"), self.w(p + ".shared_expert_gate.weight"))
             self.tick("shared expert", t)
         return out
 
     @torch.no_grad()
     def forward(self, token_ids: list) -> torch.Tensor:
         """Runs new tokens through the model, extending the caches. Returns logits for each token."""
-        x = self.w(self.prefix + "embed_tokens.weight")[torch.tensor(token_ids)]
+        self.ops.decoding = len(token_ids) == 1
+        x = self.w(self.prefix + "embed_tokens.weight")[self.to_device(torch.tensor(token_ids))]
         cos, sin = self.rope(len(token_ids))
         for layer in range(self.num_layers):
             p = f"{self.prefix}layers.{layer}"
@@ -585,6 +719,13 @@ class Qwen35MoEEngine(MoEEngine):
         z = self.linear(x, p + ".in_proj_z").view(seq_len, self.lin_v_heads, self.lin_v_dim)
         b = self.linear(x, p + ".in_proj_b")
         a = self.linear(x, p + ".in_proj_a")
+        if self.ops.compiled and self.ops.decoding:
+            # A decode token on the GPU: the rest of the layer as one compiled function
+            out, self.conv_state[layer], self.recurrent_state[layer] = self.ops.linear_attention_step(
+                mixed, z, b, a, self.conv_state[layer], self.w(p + ".conv1d.weight"), self.w(p + ".A_log"),
+                self.w(p + ".dt_bias"), self.w(p + ".norm.weight"), self.recurrent_state[layer],
+                self.lin_k_heads, self.lin_v_heads, self.lin_k_dim, self.lin_v_dim, self.eps)
+            return self.linear(out, p + ".out_proj")
 
         # Causal depthwise conv over time, continuing from the previous (kernel - 1) inputs
         conv_w = self.w(p + ".conv1d.weight")  # [channels, 1, kernel]
@@ -625,7 +766,7 @@ class Qwen35MoEEngine(MoEEngine):
         k = l2norm(k)
         state = self.recurrent_state[layer]
         if state is None:
-            state = torch.zeros(self.lin_v_heads, self.lin_k_dim, self.lin_v_dim)
+            state = torch.zeros(self.lin_v_heads, self.lin_k_dim, self.lin_v_dim, device=q.device)
         outputs = []
         for t in range(q.shape[0]):
             state = state * decay[t].exp()[:, None, None]
