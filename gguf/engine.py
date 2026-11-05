@@ -4,6 +4,7 @@ for them on Apple Silicon) and renamed to their Hugging Face names, undoing the 
 makes. The routed experts stay quantized in the pack; int4 ones (all of them, for a Q4_K/Q6_K model) run on
 torch's int4 kernel, and other types are dequantized as each one is read."""
 import fcntl
+import json
 import math
 import mmap
 import os
@@ -58,6 +59,7 @@ PRE_TOKENIZER_REGEXES = {
     "qwen35": r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 }
 CONTROL_TOKEN, USER_DEFINED_TOKEN = 3, 4  # tokenizer.ggml.token_type values
+USAGE_FILE = "expert_usage.json"  # the expert usage table, next to manifest.json in the pack
 END_TOKENS = ("<|im_end|>", "<|endoftext|>")  # Qwen's generation_config.json stops on both
 
 class GGUFExpertStore(ExpertStore):
@@ -89,6 +91,42 @@ class GGUFExpertStore(ExpertStore):
         self.slabs = {}  # layer -> its slab group (shared by layers with the same slot layout)
         if cache_bytes:
             self.build_slabs(cache_bytes)
+        self.load_usage(pack_dir)
+
+    # Expert usage table: how many tokens each (layer, expert) has been routed to, summed over every run on this
+    # pack. Kept in RAM as a [num_layers, num_experts] count tensor, saved to USAGE_FILE in the pack after a run.
+
+    def load_usage(self, pack_dir: str):
+        self.usage_path = os.path.join(pack_dir, USAGE_FILE)
+        shape = (self.manifest["num_layers"], self.manifest["num_experts"])
+        self.usage = torch.zeros(shape, dtype=torch.int64)
+        self.usage_runs = 0
+        try:
+            with open(self.usage_path) as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            return
+        counts = torch.tensor(saved["counts"], dtype=torch.int64)
+        if counts.shape != shape:
+            print(f"note: {self.usage_path} is for a different model shape; starting a new usage table")
+            return
+        self.usage, self.usage_runs = counts, saved.get("runs", 0)
+
+    def record_usage(self, layer: int, selected: torch.Tensor):
+        self.usage[layer] += torch.bincount(selected.flatten(), minlength=self.usage.shape[1])
+
+    def save_usage(self):
+        """Writes the table (to a temp file, then renamed over the old one, so an interrupted write can't lose it)."""
+        self.usage_runs += 1
+        tmp = self.usage_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"runs": self.usage_runs, "counts": self.usage.tolist()}, f)
+        os.replace(tmp, self.usage_path)
+
+    def most_used(self, layer: int, n: int = None) -> list:
+        """The layer's experts, most used first (the top n, if given), as (expert, count) pairs."""
+        counts, order = self.usage[layer].sort(descending=True, stable=True)
+        return list(zip(order.tolist(), counts.tolist()))[:n]
 
     def build_slabs(self, cache_bytes: int):
         num_experts = self.manifest["num_experts"]

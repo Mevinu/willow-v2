@@ -264,6 +264,12 @@ class ExpertStore:
         tensor = torch.frombuffer(block, dtype=SAFETENSORS_DTYPES[dtype], count=math.prod(shape), offset=part["offset"])
         return tensor.view(shape)
 
+    def record_usage(self, layer: int, selected: torch.Tensor):
+        """Called by moe with the experts each token was routed to. The GGUF store counts them; this one doesn't."""
+
+    def save_usage(self):
+        """Called once a run is done, to save what record_usage counted."""
+
     def close(self):
         self.pool.shutdown()
         os.close(self.fd)
@@ -408,6 +414,7 @@ class MoEEngine:
         if self.norm_topk_prob:
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(x.dtype)
+        self.experts.record_usage(layer, selected)
         # Start this layer's reads first, so the guesses for the next layer queue up behind them
         loads = self.experts.load_many(layer, selected.unique().tolist())
         t = self.tick("router", t)
@@ -663,6 +670,7 @@ def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir
     else:
         print(prompt, end="", flush=True)
     engine.generate(prompt, max_new_tokens, stream=True)
+    engine.experts.save_usage()
 
     print(f"\n--- stats ---\nload:     {load_seconds:.1f}s")
     for name, s in engine.stats.items():
