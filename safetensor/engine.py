@@ -135,8 +135,7 @@ class ExpertStore:
             weights = self.lookup(key)
             if weights is None and key in self.prefetched and self.prefetched[key][0].done():
                 future, token = self.prefetched.pop(key)  # a prefetch that has already finished: as good as a hit
-                weights = future.result()
-                self.finish_read(key, weights, token)
+                weights = self.finish_read(key, future.result(), token)
                 self.prefetch_used += 1
             if weights is not None:
                 hits.append((key[1], weights))
@@ -167,8 +166,7 @@ class ExpertStore:
                 done, _ = wait(reads, return_when=FIRST_COMPLETED)
                 for future in done:
                     expert, token = reads.pop(future)
-                    weights = future.result()
-                    self.finish_read((layer, expert), weights, token)
+                    weights = self.finish_read((layer, expert), future.result(), token)
                     following = next(pending, None)
                     if following is not None:
                         start(following)
@@ -221,8 +219,9 @@ class ExpertStore:
         return self.pool.submit(self.read, layer, expert), None
 
     def finish_read(self, key, weights, token):
-        """Called on the main thread once a read is done."""
+        """Called on the main thread once a read is done, with what the read returned. Returns the weights."""
         self.remember(key, weights)
+        return weights
 
     def remember(self, key, weights):
         size = sum(t.numel() * t.element_size() for t in weights)
@@ -424,23 +423,42 @@ class MoEEngine:
 
         # Run every token routed to each expert as it arrives (cache hits first, then reads as they finish).
         # "expert load" is only the time spent waiting for a read that hasn't finished yet.
-        results = []
+        # An expert whose weights are all on the GPU (a GGUF pack built with --gpu) is computed there, and its
+        # output stays there until the layer's sum is copied back once, so the CPU doesn't wait on every expert.
+        # Copies to the GPU don't wait (a waiting copy waits for all queued GPU work: ~0.2 ms each), so their CPU
+        # sources are kept in `uploads` until the blocking copy back at the end, by which time they have all run.
+        results, uploads, on_device = [], [], {}
         for expert, weights in loads:
             t = self.tick("expert load", t)
             token_idx, slot = (selected == expert).nonzero(as_tuple=True)
-            h = x[token_idx]
+            device = weights[0].device if all(w.device == weights[0].device for w in weights) else x.device
+            if device == x.device:
+                h, scale = x[token_idx], routing_weights[token_idx, slot, None]
+            else:
+                if device not in on_device:  # this layer's input and routing weights, copied once
+                    on_device[device] = (x.to(device, non_blocking=True), routing_weights.to(device, non_blocking=True))
+                index = torch.stack((token_idx, slot))
+                uploads.append(index)
+                token_idx, slot = index.to(device, non_blocking=True)
+                x_dev, weights_dev = on_device[device]
+                h, scale = x_dev[token_idx], weights_dev[token_idx, slot, None]
             if len(weights) == 2:  # fused gate_up: one matmul, then split its output
                 gate, up = F.linear(h, weights[0]).chunk(2, dim=-1)
             else:
                 gate, up = F.linear(h, weights[0]), F.linear(h, weights[1])
             h = F.linear(F.silu(gate) * up, weights[-1])
-            results.append((expert, token_idx, h * routing_weights[token_idx, slot, None]))
+            results.append((expert, token_idx, h * scale))
             t = self.tick("expert compute", t)
         # Experts arrive in whatever order their reads finish; adding them up in a fixed order keeps the
         # (bf16) output, and so greedy decoding, the same from run to run
-        out = torch.zeros_like(x)
+        sums = {}
         for _, token_idx, h in sorted(results, key=lambda r: r[0]):
-            out.index_add_(0, token_idx, h)
+            if h.device not in sums:
+                sums[h.device] = torch.zeros_like(x, device=h.device)
+            sums[h.device].index_add_(0, token_idx, h)
+        out = torch.zeros_like(x)
+        for total in sums.values():
+            out += total.to(x.device)
         self.tick("expert compute", t)
 
         # Shared expert (Qwen2-MoE / Qwen3.5-MoE): a dense MLP every token uses, scaled by a sigmoid gate

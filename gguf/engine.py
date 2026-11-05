@@ -11,7 +11,7 @@ import os
 import re
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 import torch
 from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
@@ -19,7 +19,7 @@ from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalize
 from safetensor.compiler import PAGE_ALIGNMENT, align_up
 from safetensor.engine import ExpertStore, MoEEngine, Qwen35MoEEngine, expert_weights
 from .compiler import EXPERT_RE, default_pack_dir, num_decoder_layers
-from .quants import PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize, int4_nbytes
+from .quants import INT4_LAYOUTS, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize, int4_nbytes, release_staged
 from .reader import read_gguf
 
 ENGINES = {"qwen3moe": MoEEngine, "qwen35moe": Qwen35MoEEngine}
@@ -60,6 +60,9 @@ PRE_TOKENIZER_REGEXES = {
 }
 CONTROL_TOKEN, USER_DEFINED_TOKEN = 3, 4  # tokenizer.ggml.token_type values
 USAGE_FILE = "expert_usage.json"  # the expert usage table, next to manifest.json in the pack
+SLAB_CHUNK_BYTES = 1024**3  # largest single buffer a slab is allocated as
+GPU_SLAB_MIN = 64           # slots a GPU pack reads into when the cache is off or smaller
+PRELOAD_FRACTION = 0.15  # share of each layer's experts, most used first, read into the cache at load
 END_TOKENS = ("<|im_end|>", "<|endoftext|>")  # Qwen's generation_config.json stops on both
 
 class GGUFExpertStore(ExpertStore):
@@ -72,14 +75,20 @@ class GGUFExpertStore(ExpertStore):
     Layers whose slots are the same size share a slab, with the same number of slots per layer. A slot holds the
     expert as it is computed with: int4 parts as stored, everything else as bf16, so a hit costs nothing. Layers
     that are all int4 (every layer, in a pack of a Q4_K/Q6_K model) are read straight into their slot.
-    Only the main thread changes the cache; a read thread just fills the one slot it was given."""
+    Only the main thread changes the cache; a read thread just fills the one slot it was given.
+
+    A pack built with `pack --gpu` (INT4_G32_GPU parts) computes its experts on the GPU. Its slabs are memory the
+    CPU and GPU share (see mps_shared), so an expert is read from the SSD straight into memory the GPU computes
+    from, with no copy. They always exist (with --cache-gb 0, just enough slots to read into, in GPU_SLAB_MIN), and
+    the GPU runs behind the CPU, so a slot handed out for the current layer isn't refilled until load_many starts
+    the next layer: by then the last layer's output has been copied back, which waits for the GPU."""
 
     pack_format = "gguf"
 
     def __init__(self, pack_dir: str, cache_bytes: int = 0):
         super().__init__(pack_dir, cache_bytes)
         types = {type_name for _, type_name in self.parts.values()}
-        if "INT4_G32" in types and self.manifest.get("torch_version") != torch.__version__:
+        if types & INT4_LAYOUTS and self.manifest.get("torch_version") != torch.__version__:
             raise ValueError(f"{pack_dir} was built with torch {self.manifest.get('torch_version')}, and its int4 "
                              f"layout may not match torch {torch.__version__}; rerun `main.py pack` on this model")
         if types & set(PACK_LAYOUTS):
@@ -88,8 +97,14 @@ class GGUFExpertStore(ExpertStore):
         if "INT8_G16" in types:
             print(f"note: {pack_dir} stores Q6_K experts as int8, which is dequantized as each expert is read; rerun "
                   "`main.py pack` on this model to store them as int4 (smaller, and run without dequantizing)")
+        self.gpu = "INT4_G32_GPU" in types
+        if self.gpu and not torch.backends.mps.is_available():
+            raise ValueError(f"{pack_dir} was packed for the GPU (`pack --gpu`), but torch can't use MPS here; "
+                             "rerun `main.py pack --no-gpu` on this model")
+        self.requested_cache = cache_bytes
+        self.in_use = set()  # (layer, expert) the GPU may still be computing with (GPU slabs only)
         self.slabs = {}  # layer -> its slab group (shared by layers with the same slot layout)
-        if cache_bytes:
+        if cache_bytes or self.gpu:
             self.build_slabs(cache_bytes)
         self.load_usage(pack_dir)
 
@@ -128,6 +143,39 @@ class GGUFExpertStore(ExpertStore):
         counts, order = self.usage[layer].sort(descending=True, stable=True)
         return list(zip(order.tolist(), counts.tolist()))[:n]
 
+    def preload(self, fraction: float = PRELOAD_FRACTION):
+        """Reads each layer's most used experts (by the usage table) into the cache before generating, so they
+        start as hits. At most fraction of a layer's experts, only ones that have been used, and no more than
+        the layer's share of the cache. Each layer's least used preload goes in first, so it is evicted first."""
+        if not self.usage_runs or not fraction:
+            return
+        if not self.requested_cache:
+            print("note: expert cache is off (--cache-gb 0), so the most used experts aren't preloaded")
+            return
+        start = time.perf_counter()
+        count = int(self.usage.shape[1] * fraction)
+        if self.slabs:
+            count = min(count, self.slots_per_layer)
+        else:  # the plain LRU: fit every layer's share, by its largest expert
+            layer_bytes = sum(max(self.manifest["experts"][f"{layer}_{e}"]["read_length"]
+                                  for e in range(self.usage.shape[1])) for layer in range(self.usage.shape[0]))
+            count = min(count, self.cache_bytes // layer_bytes)
+        reads = deque()
+        for layer in range(self.usage.shape[0]):
+            for expert, used in reversed(self.most_used(layer, count)):
+                if used:
+                    reads.append(((layer, expert), *self.start_read(layer, expert)))
+        loaded = len(reads)
+        while reads:  # popped as they are used, so read blocks aren't kept alive by their futures
+            key, future, token = reads.popleft()
+            weights = self.finish_read(key, future.result(), token)
+            for w in weights:
+                if isinstance(w, Int4Weight):
+                    w.to_gpu()
+        release_staged()
+        print(f"preloaded {loaded} most used experts ({self.cached_bytes / 1024**3:.2f} GiB, up to "
+              f"{count} per layer) in {time.perf_counter() - start:.1f}s")
+
     def build_slabs(self, cache_bytes: int):
         num_experts = self.manifest["num_experts"]
         self.slot_parts = {}  # layer -> {part: (offset in slot, size in slot)}
@@ -138,10 +186,10 @@ class GGUFExpertStore(ExpertStore):
             parts, offset = {}, 0
             for name in entries[0]["parts"]:
                 shape, type_name = self.parts[f"{layer}.{name}"]
-                size = int4_nbytes(shape) if type_name == "INT4_G32" else math.prod(shape) * 2
+                size = int4_nbytes(shape) if type_name in INT4_LAYOUTS else math.prod(shape) * 2
                 parts[name] = (offset, size)
                 offset += size
-            direct = all(self.parts[f"{layer}.{name}"][1] == "INT4_G32" for name in parts)
+            direct = all(self.parts[f"{layer}.{name}"][1] in INT4_LAYOUTS for name in parts)
             if direct:
                 assert all(e["parts"][n]["offset"] == parts[n][0] for e in entries for n in parts)
                 offset = max(e["read_length"] for e in entries)
@@ -149,13 +197,26 @@ class GGUFExpertStore(ExpertStore):
             layouts.setdefault((direct, align_up(offset, PAGE_ALIGNMENT)), []).append(layer)
 
         per_layer = cache_bytes // sum(slot * len(layers) for (_, slot), layers in layouts.items())
-        if per_layer * min(len(layers) for layers in layouts.values()) < 2 * self.read_ahead:
-            print("note: --cache-gb is too small to be useful; cache off")
-            self.cache_bytes = 0
-            return
+        fewest_layers = min(len(layers) for layers in layouts.values())
+        if per_layer * fewest_layers < 2 * self.read_ahead:
+            if not self.gpu:
+                print("note: --cache-gb is too small to be useful; cache off")
+                self.cache_bytes = 0
+                return
+            per_layer = max(per_layer, -(-GPU_SLAB_MIN // fewest_layers))
+        self.slots_per_layer = per_layer
+        if self.gpu:
+            from .mps_shared import shared_empty
         for (_, slot), layers in layouts.items():
             count = per_layer * len(layers)
-            group = {"slab": mmap.mmap(-1, count * slot), "slot": slot, "free": list(range(count)),
+            # A slab is cut into chunks of whole slots (Metal limits the size of one buffer)
+            per_chunk = max(1, min(count, SLAB_CHUNK_BYTES // slot))
+            chunks = []
+            for start in range(0, count, per_chunk):
+                size = min(per_chunk, count - start) * slot
+                chunks.append(shared_empty(size)[::-1] if self.gpu else (mmap.mmap(-1, size), None))
+            group = {"chunks": chunks,  # (CPU-writable buffer, the same bytes as a GPU tensor or None)
+                     "per_chunk": per_chunk, "slot": slot, "free": list(range(count)),
                      "lru": OrderedDict()}  # lru: (layer, expert) -> slot number, least recently used first
             for layer in layers:
                 self.slabs[layer] = group
@@ -189,26 +250,36 @@ class GGUFExpertStore(ExpertStore):
             return super().finish_read(key, weights, slot)
         if slot is not None:
             group = self.slabs[key[0]]
+            if weights is None:  # a GPU slot: its views are made here, on the main thread
+                weights = self.gpu_slot_weights(group, slot, key[0])
             group["lru"][key] = slot
             self.cache[key] = weights
             self.cached_bytes += group["slot"]
+        return weights
 
     def take_slot(self, group: dict):
-        """A free slot, else the least recently used one not handed out by load_many (None if there is none).
-        Slots being filled are in neither the free list nor the LRU, so they are never taken."""
+        """A free slot, else the least recently used one not handed out by load_many, nor (GPU slabs) used since
+        the GPU last caught up (None if there is none). Slots being filled are in neither the free list nor the LRU,
+        so they are never taken."""
         if group["free"]:
             return group["free"].pop()
-        victim = next((key for key in group["lru"] if key not in self.busy), None)
+        victim = next((key for key in group["lru"] if key not in self.busy and key not in self.in_use), None)
         if victim is None:
             return None
         del self.cache[victim]
         self.cached_bytes -= group["slot"]
         return group["lru"].pop(victim)
 
+    def slot_place(self, group: dict, slot: int):
+        """(CPU buffer, GPU tensor or None, offset of the slot in them)."""
+        host, gpu = group["chunks"][slot // group["per_chunk"]]
+        return host, gpu, slot % group["per_chunk"] * group["slot"]
+
     def fill(self, layer: int, expert: int, group: dict, slot: int):
-        """Reads one expert into its slot and returns its weights, viewing the slot. Runs on the thread pool."""
+        """Reads one expert into its slot and returns its weights, viewing the slot (None for a GPU slot: those
+        views are made by finish_read on the main thread). Runs on the thread pool."""
         entry = self.manifest["experts"][f"{layer}_{expert}"]
-        slab, base = group["slab"], slot * group["slot"]
+        slab, gpu, base = self.slot_place(group, slot)
         with memoryview(slab) as view:
             if self.direct[layer]:
                 self.pread(view[base:base + entry["read_length"]], layer, expert, entry)
@@ -217,11 +288,24 @@ class GGUFExpertStore(ExpertStore):
                 self.pread(block, layer, expert, entry)
                 for name, part in entry["parts"].items():
                     offset, size = self.slot_parts[layer][name]
-                    if self.parts[f"{layer}.{name}"][1] == "INT4_G32":
+                    if self.parts[f"{layer}.{name}"][1] in INT4_LAYOUTS:
                         view[base + offset:base + offset + size] = memoryview(block)[part["offset"]:part["offset"] + size]
                     else:
                         self.slot_tensor(slab, base, layer, name).copy_(self.part_tensor(block, layer, name, part))
+        if gpu is not None:
+            return None
         return expert_weights({name: self.slot_tensor(slab, base, layer, name) for name in self.slot_parts[layer]})
+
+    def gpu_slot_weights(self, group: dict, slot: int, layer: int):
+        """An expert's weights as views of its GPU slot."""
+        _, gpu, base = self.slot_place(group, slot)
+        parts = {}
+        for name, (offset, size) in self.slot_parts[layer].items():
+            shape, type_name = self.parts[f"{layer}.{name}"]
+            raw = gpu[base + offset:base + offset + size]
+            parts[name] = (Int4Weight.from_gpu_bytes(raw, shape) if type_name in INT4_LAYOUTS
+                           else raw.view(torch.bfloat16).view(shape))
+        return expert_weights(parts)
 
     def slot_tensor(self, slab: mmap.mmap, base: int, layer: int, name: str):
         shape, type_name = self.parts[f"{layer}.{name}"]
@@ -259,10 +343,17 @@ class GGUFExpertStore(ExpertStore):
             self.cache[key] = weights
             self.cached_bytes += size
 
+    def load_many(self, layer: int, experts: list):
+        if self.gpu:
+            # The last layer's output has been copied back, so the GPU is done with its slots and copies
+            release_staged()
+            self.in_use = {(layer, expert) for expert in experts}
+        return super().load_many(layer, experts)
+
     def part_tensor(self, block: bytearray, layer: int, name: str, part: dict):
         shape, type_name = self.parts[f"{layer}.{name}"]
-        if type_name == "INT4_G32":
-            return Int4Weight.from_buffer(block, part["offset"], shape)
+        if type_name in INT4_LAYOUTS:
+            return Int4Weight.from_buffer(block, part["offset"], shape, gpu=type_name == "INT4_G32_GPU")
         if type_name == "INT8_G16":
             return dequant_int8_g16(block, part["offset"], shape)
         raw = torch.frombuffer(block, dtype=torch.uint8, count=part["size"], offset=part["offset"])
@@ -442,17 +533,9 @@ def build_tokenizer(metadata: dict) -> Tokenizer:
                           for i, kind in enumerate(types) if kind == USER_DEFINED_TOKEN])
     return tokenizer
 
-DEFAULT_CACHE_GB = 8.0   # expert cache when --cache-gb isn't given...
-RAM_HEADROOM_GB = 4.0    # ...shrunk so the weights + cache leave this much RAM for macOS, the KV cache and buffers
-
-def auto_cache_gb(weights: dict) -> float:
-    """DEFAULT_CACHE_GB, or less if the machine can't spare it next to the resident weights."""
-    total_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
-    weights_gb = sum(t.nbytes for t in weights.values()) / 1024**3
-    return max(0.0, min(DEFAULT_CACHE_GB, total_gb - weights_gb - RAM_HEADROOM_GB))
-
-def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None) -> MoEEngine:
-    """cache_gb None (no --cache-gb) sizes the expert cache automatically: see auto_cache_gb."""
+def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, preload: bool = True) -> MoEEngine:
+    """cache_gb None or 0 (no --cache-gb) turns the expert cache off. preload reads the most used experts into
+    the cache first (see GGUFExpertStore.preload)."""
     metadata, tensors = read_gguf(gguf_path)
     arch = metadata.get("general.architecture")
     if arch not in ENGINES:
@@ -467,8 +550,7 @@ def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None) ->
     cfg["bos_token_id"] = metadata.get("tokenizer.ggml.bos_token_id", vocab.get("<|endoftext|>"))
 
     weights = load_weights(arch, engine_class.prefix, cfg, tensors)
-    if cache_gb is None:
-        cache_gb = auto_cache_gb(weights)
-        print(f"expert cache: {cache_gb:.1f} GiB (auto; set it with --cache-gb)")
-    experts = GGUFExpertStore(pack_dir or default_pack_dir(gguf_path), int(cache_gb * 1024**3))
+    experts = GGUFExpertStore(pack_dir or default_pack_dir(gguf_path), int((cache_gb or 0) * 1024**3))
+    if preload:
+        experts.preload()
     return engine_class(cfg, eos_ids, weights, experts, tokenizer)

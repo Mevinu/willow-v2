@@ -1,6 +1,7 @@
 """Dequantizes ggml tensors with torch. Each function takes the raw bytes as a uint8 tensor of shape
 [n_blocks, bytes_per_block] and returns float32 values of shape [n_blocks, elements_per_block].
 Ported from the numpy reference in llama.cpp's gguf-py (gguf/quants.py)."""
+import functools
 import math
 
 import torch
@@ -151,7 +152,11 @@ def dequantize(raw, type_name: str, shape: tuple, dtype: torch.dtype = torch.bfl
 #     bf16. Q4_K converts exactly; Q6_K is requantized to 4 bits (some precision is lost).
 #   INT8_G16 (older packs, from Q6_K): int8 values [rows, k], then one bf16 scale per 16 values [rows, k/16].
 #     Dequantizing it is one multiply. Still readable, but no longer written.
+#   INT4_G32_GPU (`pack --gpu`): the same, but packed in torch's MPS int4 format ([rows/8, k/(16 * tiles), 32,
+#     tiles/2] int32), so a read only has to be copied to the GPU.
 INT4_GROUP, INT8_GROUP = 32, 16
+GPU = torch.device("mps")
+MPS_INNER_K_TILES = 4  # tiling of the MPS int4 format (torch allows 2, 4 or 8)
 
 def _to_bytes(t: torch.Tensor) -> bytes:
     out = bytearray(t.numel() * t.element_size())
@@ -161,9 +166,14 @@ def _to_bytes(t: torch.Tensor) -> bytes:
 def _blocks(raw, type_name: str) -> torch.Tensor:
     return torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(-1, BLOCK_SIZES[type_name][1])
 
-def pack_int4(q: torch.Tensor, scales_and_zeros: torch.Tensor) -> bytes:
-    """4-bit values [rows, k] (0..15) and (scale, zero) [k/32, rows, 2] -> INT4_G32 bytes."""
-    packed = torch._convert_weight_to_int4pack_for_cpu(q.to(torch.int32).contiguous(), 1)
+def pack_int4(q: torch.Tensor, scales_and_zeros: torch.Tensor, gpu: bool = False) -> bytes:
+    """4-bit values [rows, k] (0..15) and (scale, zero) [k/32, rows, 2] -> INT4_G32 bytes (INT4_G32_GPU with gpu,
+    packed by torch on the GPU, so it needs MPS)."""
+    if gpu:
+        pairs = ((q[:, 0::2] << 4) | q[:, 1::2]).to(torch.uint8)  # the MPS packer takes [rows, k/2], even k high
+        packed = torch._convert_weight_to_int4pack(pairs.to(GPU), MPS_INNER_K_TILES).cpu()
+    else:
+        packed = torch._convert_weight_to_int4pack_for_cpu(q.to(torch.int32).contiguous(), 1)
     return _to_bytes(packed) + _to_bytes(scales_and_zeros.to(torch.bfloat16))
 
 def q4_k_int4_parts(raw, shape: tuple):
@@ -187,14 +197,14 @@ def float_to_int4_parts(w: torch.Tensor):
     q = torch.round((g - zero[..., None]) / scale[..., None] + 8).clamp_(0, 15).to(torch.int32)
     return q.reshape(rows, k), torch.stack((scale, zero), dim=-1).transpose(0, 1)
 
-def q4_k_to_int4(raw: bytes, shape: tuple) -> bytes:
-    return pack_int4(*q4_k_int4_parts(raw, shape))
+def q4_k_to_int4(raw: bytes, shape: tuple, gpu: bool = False) -> bytes:
+    return pack_int4(*q4_k_int4_parts(raw, shape), gpu)
 
-def q6_k_to_int4(raw: bytes, shape: tuple) -> bytes:
+def q6_k_to_int4(raw: bytes, shape: tuple, gpu: bool = False) -> bytes:
     """Dequantizes Q6_K at pack time and requantizes it to INT4_G32, so every expert runs on the int4 kernel
     and can be read straight into its cache slot."""
     rows, k = shape
-    return pack_int4(*float_to_int4_parts(dequant_q6_k(_blocks(raw, "Q6_K")).reshape(rows, k)))
+    return pack_int4(*float_to_int4_parts(dequant_q6_k(_blocks(raw, "Q6_K")).reshape(rows, k)), gpu)
 
 def q6_k_to_int8(raw: bytes, shape: tuple) -> bytes:
     rows, k = shape
@@ -211,11 +221,34 @@ def int8_nbytes(shape: tuple) -> int:
 
 # ggml type -> (pack layout, its size for a [rows, k] part, converter from the ggml bytes)
 PACK_LAYOUTS = {"Q4_K": ("INT4_G32", int4_nbytes, q4_k_to_int4), "Q6_K": ("INT4_G32", int4_nbytes, q6_k_to_int4)}
+PACK_LAYOUTS_GPU = {"Q4_K": ("INT4_G32_GPU", int4_nbytes, functools.partial(q4_k_to_int4, gpu=True)),
+                    "Q6_K": ("INT4_G32_GPU", int4_nbytes, functools.partial(q6_k_to_int4, gpu=True))}
+INT4_LAYOUTS = {"INT4_G32", "INT4_G32_GPU"}
 INT4_ROW_MULTIPLE = 16  # torch's int4 packing needs the row count to be a multiple of 16
 
+def int4_packable(shape, gpu: bool) -> bool:
+    rows, k = shape
+    return rows % INT4_ROW_MULTIPLE == 0 and (not gpu or k % (16 * MPS_INNER_K_TILES) == 0)
+
+_staged, _staged_bytes = [], 0  # CPU tensors being copied to the GPU, kept alive until it has run the copies
+STAGED_LIMIT = 256 * 1024**2
+
+def release_staged():
+    """Waits for the GPU (if anything is staged) and lets go of the CPU side of finished copies."""
+    global _staged_bytes
+    if _staged:
+        torch.mps.synchronize()
+        _staged.clear()
+        _staged_bytes = 0
+
 class Int4Weight:
-    """A [rows, k] INT4_G32 weight, used in place of a bf16 tensor. F.linear(x, weight) runs torch's int4 kernel
-    (through __torch_function__), so the model code needs no changes."""
+    """A [rows, k] int4 weight, used in place of a bf16 tensor. F.linear(x, weight) runs torch's int4 kernel
+    (through __torch_function__), so the model code needs no changes.
+
+    An INT4_G32 weight computes on the CPU. An INT4_G32_GPU one (gpu=True) computes on the GPU (MPS): the first
+    time it is used, or when to_gpu() is called, it is copied there without waiting, and its CPU bytes are let go
+    once the copy has run (see release_staged). Call those on the main thread only. .device is where it computes,
+    so callers can send their input there; the output comes back on the input's device."""
 
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
@@ -224,25 +257,51 @@ class Int4Weight:
             return args[1].linear(args[0])
         return NotImplemented
 
-    def __init__(self, packed: torch.Tensor, scales_and_zeros: torch.Tensor):
+    def __init__(self, packed: torch.Tensor, scales_and_zeros: torch.Tensor, gpu: bool = False):
         self.packed, self.scales_and_zeros = packed, scales_and_zeros
+        self.nbytes = packed.nbytes + scales_and_zeros.nbytes
+        self.device = GPU if gpu else torch.device("cpu")
 
     @classmethod
-    def from_buffer(cls, buf, offset: int, shape: tuple) -> "Int4Weight":
+    def from_buffer(cls, buf, offset: int, shape: tuple, gpu: bool = False) -> "Int4Weight":
         """Views the weight inside buf (no copy)."""
         rows, k = shape
-        packed = torch.frombuffer(buf, dtype=torch.uint8, count=rows * k // 2, offset=offset)
+        if gpu:
+            packed = torch.frombuffer(buf, dtype=torch.int32, count=rows * k // 8, offset=offset)
+            packed = packed.view(rows // 8, k // (16 * MPS_INNER_K_TILES), 32, MPS_INNER_K_TILES // 2)
+        else:
+            packed = torch.frombuffer(buf, dtype=torch.uint8, count=rows * k // 2, offset=offset).view(rows, k // 2)
         scales_and_zeros = torch.frombuffer(buf, dtype=torch.bfloat16, count=k // INT4_GROUP * rows * 2,
                                             offset=offset + rows * k // 2)
-        return cls(packed.view(rows, k // 2), scales_and_zeros.view(k // INT4_GROUP, rows, 2))
+        return cls(packed, scales_and_zeros.view(k // INT4_GROUP, rows, 2), gpu)
 
-    @property
-    def nbytes(self) -> int:
-        return self.packed.nbytes + self.scales_and_zeros.nbytes
+    @classmethod
+    def from_gpu_bytes(cls, raw: torch.Tensor, shape: tuple) -> "Int4Weight":
+        """Views an INT4_G32_GPU weight inside raw, a uint8 tensor already on the GPU (no copy)."""
+        rows, k = shape
+        packed = raw[:rows * k // 2].view(torch.int32)
+        packed = packed.view(rows // 8, k // (16 * MPS_INNER_K_TILES), 32, MPS_INNER_K_TILES // 2)
+        scales_and_zeros = raw[rows * k // 2:int4_nbytes(shape)].view(torch.bfloat16)
+        return cls(packed, scales_and_zeros.view(k // INT4_GROUP, rows, 2), gpu=True)
+
+    def to_gpu(self):
+        global _staged_bytes
+        if self.device != GPU or self.packed.device == GPU:
+            return
+        if _staged_bytes + self.nbytes > STAGED_LIMIT:
+            release_staged()
+        _staged.append((self.packed, self.scales_and_zeros))
+        _staged_bytes += self.nbytes
+        self.packed = self.packed.to(GPU, non_blocking=True)
+        self.scales_and_zeros = self.scales_and_zeros.to(GPU, non_blocking=True)
 
     def linear(self, x: torch.Tensor) -> torch.Tensor:
-        y = torch._weight_int4pack_mm_for_cpu(x.reshape(-1, x.shape[-1]), self.packed, INT4_GROUP,
-                                              self.scales_and_zeros)
+        flat = x.reshape(-1, x.shape[-1])
+        if self.device == GPU:
+            self.to_gpu()
+            y = torch._weight_int4pack_mm(flat.to(GPU), self.packed, INT4_GROUP, self.scales_and_zeros).to(x.device)
+        else:
+            y = torch._weight_int4pack_mm_for_cpu(flat, self.packed, INT4_GROUP, self.scales_and_zeros)
         return y.view(*x.shape[:-1], y.shape[-1])
 
 def dequant_int8_g16(buf, offset: int, shape: tuple) -> torch.Tensor:
