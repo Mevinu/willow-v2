@@ -21,9 +21,10 @@ def main():
                      help="upper limit; generation stops earlier when the model emits an end token")
     run.add_argument("--pack-dir", default=None, help="Default: where `main.py pack` writes it")
     run.add_argument("--think", action="store_true", help="Let chat models think before answering")
-    run.add_argument("--cache-gb", type=float, default=0.0,
-                     help="RAM for caching recently used experts (default off: on a 16 GB Mac the OS file cache "
-                          "does better, and an explicit cache causes memory pressure)")
+    run.add_argument("--cache-gb", type=float, default=None,
+                     help="RAM for caching recently used experts. Default for .gguf: 8 GiB, less if RAM is short "
+                          "(4 GiB is left free). Default for safetensors: off (on a 16 GB Mac the OS file cache "
+                          "does better with bf16 experts)")
     args = parser.parse_args()
 
     if args.command == "pack":

@@ -78,6 +78,8 @@ def compute_inv_freq(cfg: dict, head_dim: int):
     inv_freq = (1.0 / (factor * pos_freqs)) * (1 - extrapolation_factor) + (1.0 / pos_freqs) * extrapolation_factor
     return inv_freq, attention_factor
 
+PREFETCH_MAX_IN_FLIGHT = 4  # ExpertStore.prefetch does nothing while this many reads are already running
+
 def expert_weights(parts: dict) -> tuple:
     """An expert's parts by name -> (gate_up, down) when gate and up are fused into one
     [2 * intermediate, hidden] matrix (gate rows first), else (gate, up, down)."""
@@ -116,7 +118,7 @@ class ExpertStore:
         self.in_flight = 0
         self.busy_since = 0.0
         self.busy = set()     # (layer, expert) handed out by load_many and not yet consumed
-        self.inflight = {}    # (layer, expert) -> (future, token): prefetches not yet picked up
+        self.prefetched = {}  # (layer, expert) -> (future, token): prefetch reads not yet picked up
         self.prefetches = 0       # prefetch reads started
         self.prefetch_used = 0    # of those, ones load_many then asked for
 
@@ -126,13 +128,13 @@ class ExpertStore:
         read_ahead of them; for a decode step, all), so the SSD works on them while the caller computes the
         cache hits, which come first. Misses then come in the order their reads finish."""
         keys = [(layer, expert) for expert in experts]
-        self.collect_prefetches(exclude=set(keys))
+        self.collect_prefetches(layer, exclude=set(keys))
         self.busy.update(keys)  # their cache entries must not be evicted until they have been consumed
         hits, misses = [], []
         for key in keys:
             weights = self.lookup(key)
-            if weights is None and key in self.inflight and self.inflight[key][0].done():
-                future, token = self.inflight.pop(key)  # a prefetch that has already finished: as good as a hit
+            if weights is None and key in self.prefetched and self.prefetched[key][0].done():
+                future, token = self.prefetched.pop(key)  # a prefetch that has already finished: as good as a hit
                 weights = future.result()
                 self.finish_read(key, weights, token)
                 self.prefetch_used += 1
@@ -144,9 +146,9 @@ class ExpertStore:
         reads = {}  # future -> (expert, token for finish_read)
         def start(expert):
             key = (layer, expert)
-            if key in self.inflight:  # prefetched, still reading
+            if key in self.prefetched:  # prefetched, still reading
                 self.prefetch_used += 1
-                future, token = self.inflight.pop(key)
+                future, token = self.prefetched.pop(key)
             else:
                 future, token = self.start_read(layer, expert)
             reads[future] = (expert, token)
@@ -176,23 +178,34 @@ class ExpertStore:
             self.busy.difference_update(keys)
 
     def prefetch(self, layer: int, experts: list):
-        """Starts reading experts that will probably be needed soon, without waiting for them. load_many picks
-        up the reads it needs; ones it never asks for go into the cache once they finish."""
+        """Starts reading experts that will probably be needed soon, without waiting for them. load_many reuses
+        these reads (they are never read twice); ones it never asks for go into the cache once they finish, or
+        are dropped if there is no cache. Skipped while the current layer still has PREFETCH_MAX_IN_FLIGHT or
+        more reads in flight, so guesses never hold up reads that are actually needed."""
+        if self.in_flight >= PREFETCH_MAX_IN_FLIGHT:
+            return
         for expert in experts:
             key = (layer, expert)
-            if key in self.cache or key in self.inflight:
+            if key in self.cache or key in self.prefetched:
                 continue
             started = self.start_read(layer, expert, prefetch=True)
             if started is None:
                 break
-            self.inflight[key] = started
+            self.prefetched[key] = started
             self.prefetches += 1
 
-    def collect_prefetches(self, exclude: set = frozenset()):
-        """Moves finished prefetches nobody asked for into the cache. Runs on the main thread."""
-        for key, (future, token) in list(self.inflight.items()):
-            if key not in exclude and future.done():
-                del self.inflight[key]
+    def collect_prefetches(self, layer: int, exclude: set = frozenset()):
+        """Deals with prefetches load_many isn't asking for, as it starts on layer: finished ones go into the cache.
+        Without a cache, a guess is only worth anything to the layer it was made for, so guesses for this layer
+        or earlier are dropped (cancelled, if their read hasn't started). Runs on the main thread."""
+        for key, (future, token) in list(self.prefetched.items()):
+            if key in exclude:
+                continue
+            if not self.cache_bytes and key[0] <= layer:
+                del self.prefetched[key]
+                future.cancel()
+            elif future.done():
+                del self.prefetched[key]
                 self.finish_read(key, future.result(), token)
 
     def lookup(self, key):
@@ -602,7 +615,7 @@ class Qwen35MoEEngine(MoEEngine):
 
 ENGINES = {"qwen3_moe": MoEEngine, "qwen3_5_moe": Qwen35MoEEngine}
 
-def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = 0) -> MoEEngine:
+def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = None) -> MoEEngine:
     with open(os.path.join(model_dir, "config.json")) as f:
         full_cfg = json.load(f)
     model_type = full_cfg.get("model_type")
@@ -632,12 +645,13 @@ def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = 0) -> Mo
                     tensor = f.get_tensor(name)
                     weights[name] = tensor if name in lazy else tensor.clone()
 
-    experts = ExpertStore(pack_dir or os.path.join(model_dir, "expert_pack"), int(cache_gb * 1024**3))
+    # No cache by default: bf16 experts are big, and the OS file cache holds recent ones without the memory pressure
+    experts = ExpertStore(pack_dir or os.path.join(model_dir, "expert_pack"), int((cache_gb or 0) * 1024**3))
     tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
     return engine_class(cfg, eos_ids, weights, experts, tokenizer)
 
 def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir: str = None,
-               think: bool = False, cache_gb: float = 0.0, load=load_engine):
+               think: bool = False, cache_gb: float = None, load=load_engine):
     """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`).
     load builds the engine from model_dir: load_engine here, gguf.engine.load_engine for .gguf files."""
     start = time.perf_counter()
@@ -666,7 +680,8 @@ def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir
             print(f"{'':9} prefetch: {s['prefetches']} next-layer reads started, "
                   f"{s['prefetch_used'] / s['prefetches'] * 100:.0f}% of them used")
     cache = engine.experts
-    print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache_gb:.2f} GiB used, {len(cache.cache)} experts held")
+    print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache.cache_bytes / 1024**3:.2f} GiB used, "
+          f"{len(cache.cache)} experts held")
 
     decode = engine.stats.get("decode")
     if decode and decode["tokens"]:

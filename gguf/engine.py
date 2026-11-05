@@ -1,9 +1,8 @@
 """Runs GGUF models (as made by llama.cpp's convert_hf_to_gguf.py) on the same model code as the safetensors
-engine. The non-expert weights are loaded at startup and renamed to their Hugging Face names, undoing the changes
-llama.cpp's converter makes: the big projection matrices (attention, linear attention, shared expert, lm_head)
-become 4-bit Int4Weights, and the rest (embeddings, routers, norms, conv) bf16 or float32. The routed experts stay
-quantized in the pack; int4 ones (all of them, for a Q4_K/Q6_K model) run on torch's int4 kernel, and other types
-are dequantized as each one is read."""
+engine. The non-expert weights are dequantized to bf16 at load (bf16 matmuls run faster than torch's int4 kernel
+for them on Apple Silicon) and renamed to their Hugging Face names, undoing the changes llama.cpp's converter
+makes. The routed experts stay quantized in the pack; int4 ones (all of them, for a Q4_K/Q6_K model) run on
+torch's int4 kernel, and other types are dequantized as each one is read."""
 import fcntl
 import math
 import mmap
@@ -19,8 +18,7 @@ from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalize
 from safetensor.compiler import PAGE_ALIGNMENT, align_up
 from safetensor.engine import ExpertStore, MoEEngine, Qwen35MoEEngine, expert_weights
 from .compiler import EXPERT_RE, default_pack_dir, num_decoder_layers
-from .quants import (INT4_GROUP, INT4_ROW_MULTIPLE, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize,
-                     float_to_int4_parts, int4_nbytes, q4_k_int4_parts)
+from .quants import PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize, int4_nbytes
 from .reader import read_gguf
 
 ENGINES = {"qwen3moe": MoEEngine, "qwen35moe": Qwen35MoEEngine}
@@ -53,13 +51,6 @@ LAYER_NAMES = {
 GLOBAL_NAMES = {"token_embd.weight": "embed_tokens.weight", "output_norm.weight": "norm.weight"}
 LAYER_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 KEEP_FLOAT32 = (".linear_attn.A_log", ".linear_attn.dt_bias")  # the engine computes with these in float32
-# Projection matrices kept as 4-bit Int4Weights instead of bf16: about 3.5x less RAM, and faster to multiply.
-# The embedding table (one row read per token), routers, norms and conv weights stay bf16/float32, and so do
-# linear attention's in_proj_a/in_proj_b: they are tiny and set the recurrent state's decay, which is sensitive.
-INT4_WEIGHTS = re.compile(r"^lm_head\.weight$|\.self_attn\.[qkvo]_proj\.weight$"
-                          r"|\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)\.weight$"
-                          r"|\.mlp\.shared_expert\.(gate|up|down)_proj\.weight$")
-INT4_CHUNK_ROWS = 8192  # rows quantized at a time, so a big table like lm_head needs little temporary memory
 
 # Pre-tokenizer regexes, from the models' tokenizer.json (llama.cpp's tokenizer.ggml.pre names them)
 PRE_TOKENIZER_REGEXES = {
@@ -356,45 +347,8 @@ def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict):
         raise NotImplementedError(f"Don't know where GGUF tensor {gguf_name} goes")
     return [(p + LAYER_NAMES[rest], None)]
 
-def tensor_to_int4_weight(t: torch.Tensor) -> Int4Weight:
-    """A [rows, k] float tensor -> an INT4_G32 Int4Weight (min/max per group of 32), quantized in row chunks."""
-    packed, scales = [], []
-    for start in range(0, t.shape[0], INT4_CHUNK_ROWS):
-        q, sz = float_to_int4_parts(t[start:start + INT4_CHUNK_ROWS])
-        packed.append(torch._convert_weight_to_int4pack_for_cpu(q, 1))
-        scales.append(sz.to(torch.bfloat16))
-    return Int4Weight(torch.cat(packed), torch.cat(scales, dim=1).contiguous())
-
-def ggml_to_int4_weight(raw: bytearray, type_name: str, shape: tuple, rows: slice = None) -> Int4Weight:
-    """A 2D ggml tensor's bytes (optionally just some of its rows) -> an Int4Weight, a chunk of rows at a time
-    (quant blocks never cross rows). Q4_K converts exactly; other types are dequantized and requantized."""
-    num_rows, k = shape
-    start, stop, _ = (rows or slice(None)).indices(num_rows)
-    row_bytes = len(raw) // num_rows
-    packed, scales = [], []
-    with memoryview(raw) as view:
-        for r in range(start, stop, INT4_CHUNK_ROWS):
-            n = min(INT4_CHUNK_ROWS, stop - r)
-            chunk = view[r * row_bytes:(r + n) * row_bytes]
-            if type_name == "Q4_K":
-                q, sz = q4_k_int4_parts(chunk, (n, k))
-            else:
-                q, sz = float_to_int4_parts(dequantize(chunk, type_name, (n, k), torch.float32))
-            packed.append(torch._convert_weight_to_int4pack_for_cpu(q, 1))
-            scales.append(sz.to(torch.bfloat16))
-    return Int4Weight(torch.cat(packed), torch.cat(scales, dim=1).contiguous())
-
-def wants_int4(name: str, gguf_name: str, t, rows: slice, tensors: dict) -> bool:
-    if not INT4_WEIGHTS.search(name) or len(t.shape) != 2:
-        return False
-    if gguf_name.removesuffix(".weight") + ".bias" in tensors:
-        return False  # Int4Weight's F.linear has no bias
-    start, stop, _ = (rows or slice(None)).indices(t.shape[0])
-    return (t.shape[1] % INT4_GROUP == 0 and start % INT4_ROW_MULTIPLE == 0
-            and (stop - start) % INT4_ROW_MULTIPLE == 0)
-
 def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
-    """Reads every non-expert tensor. Returns {Hugging Face name: tensor or Int4Weight}, all resident in RAM."""
+    """Reads and dequantizes every non-expert tensor. Returns {Hugging Face name: tensor}, all resident in RAM."""
     weights = {}
     fds = {}
     try:
@@ -409,16 +363,8 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
                 raise IOError(f"short read for {gguf_name} in {t.path}")
             for name, rows in targets:
                 # Tensors that need the converter's changes undone go through float32; the rest (including the
-                # big embedding and output tables) dequantize straight to bf16 (or int4)
+                # big embedding and output tables) dequantize straight to bf16
                 fix = arch == "qwen35moe" and (".linear_attn." in name or name.endswith(("norm.weight", "_gate.weight")))
-                if wants_int4(name, gguf_name, t, rows, tensors):
-                    if not fix:
-                        weights[name] = ggml_to_int4_weight(raw, t.type, t.shape, rows)
-                        continue
-                    tensor = dequantize(raw, t.type, t.shape, torch.float32)
-                    tensor = tensor[rows] if rows is not None else tensor
-                    weights[name] = tensor_to_int4_weight(fix_qwen35_tensor(name, tensor, cfg))
-                    continue
                 keep_float32 = name.endswith(KEEP_FLOAT32)
                 tensor = dequantize(raw, t.type, t.shape, torch.float32 if fix or keep_float32 else torch.bfloat16)
                 if rows is not None:
@@ -429,10 +375,6 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
     finally:
         for fd in fds.values():
             os.close(fd)
-    embed = weights.get(prefix + "embed_tokens.weight")
-    if "lm_head.weight" not in weights and embed is not None and embed.shape[0] % INT4_ROW_MULTIPLE == 0:
-        # Tied embeddings: the table stays bf16 for lookups, and lm_head gets its own int4 copy
-        weights["lm_head.weight"] = tensor_to_int4_weight(embed)
     return weights
 
 def build_tokenizer(metadata: dict) -> Tokenizer:
@@ -462,7 +404,17 @@ def build_tokenizer(metadata: dict) -> Tokenizer:
                           for i, kind in enumerate(types) if kind == USER_DEFINED_TOKEN])
     return tokenizer
 
-def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = 0) -> MoEEngine:
+DEFAULT_CACHE_GB = 8.0   # expert cache when --cache-gb isn't given...
+RAM_HEADROOM_GB = 4.0    # ...shrunk so the weights + cache leave this much RAM for macOS, the KV cache and buffers
+
+def auto_cache_gb(weights: dict) -> float:
+    """DEFAULT_CACHE_GB, or less if the machine can't spare it next to the resident weights."""
+    total_gb = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1024**3
+    weights_gb = sum(t.nbytes for t in weights.values()) / 1024**3
+    return max(0.0, min(DEFAULT_CACHE_GB, total_gb - weights_gb - RAM_HEADROOM_GB))
+
+def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None) -> MoEEngine:
+    """cache_gb None (no --cache-gb) sizes the expert cache automatically: see auto_cache_gb."""
     metadata, tensors = read_gguf(gguf_path)
     arch = metadata.get("general.architecture")
     if arch not in ENGINES:
@@ -477,5 +429,8 @@ def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = 0) -> Mo
     cfg["bos_token_id"] = metadata.get("tokenizer.ggml.bos_token_id", vocab.get("<|endoftext|>"))
 
     weights = load_weights(arch, engine_class.prefix, cfg, tensors)
+    if cache_gb is None:
+        cache_gb = auto_cache_gb(weights)
+        print(f"expert cache: {cache_gb:.1f} GiB (auto; set it with --cache-gb)")
     experts = GGUFExpertStore(pack_dir or default_pack_dir(gguf_path), int(cache_gb * 1024**3))
     return engine_class(cfg, eos_ids, weights, experts, tokenizer)
