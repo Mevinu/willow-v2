@@ -78,7 +78,7 @@ def compute_inv_freq(cfg: dict, head_dim: int):
     inv_freq = (1.0 / (factor * pos_freqs)) * (1 - extrapolation_factor) + (1.0 / pos_freqs) * extrapolation_factor
     return inv_freq, attention_factor
 
-PREFETCH_MAX_IN_FLIGHT = 4  # ExpertStore.prefetch does nothing while this many reads are already running
+PREFETCH_MAX_IN_FLIGHT = 4  # default ExpertStore.prefetch_max_in_flight
 
 def expert_weights(parts: dict) -> tuple:
     """An expert's parts by name -> (gate_up, down) when gate and up are fused into one
@@ -92,6 +92,10 @@ class ExpertStore:
     A layer's experts are read in parallel on a thread pool (os.preadv releases the GIL), so the SSD has many
     requests in flight and later reads finish while earlier experts are being computed.
     Recently used experts are kept in an LRU cache of up to cache_bytes."""
+
+    # prefetch does nothing while this many reads are already running (None: never skip). The pool runs reads in
+    # the order they were submitted, so even uncapped, guesses only start once the current layer's reads have.
+    prefetch_max_in_flight = PREFETCH_MAX_IN_FLIGHT
 
     pack_format = "safetensors"  # the manifest's "format"; packs from before the field existed are safetensors
 
@@ -178,9 +182,9 @@ class ExpertStore:
     def prefetch(self, layer: int, experts: list):
         """Starts reading experts that will probably be needed soon, without waiting for them. load_many reuses
         these reads (they are never read twice); ones it never asks for go into the cache once they finish, or
-        are dropped if there is no cache. Skipped while the current layer still has PREFETCH_MAX_IN_FLIGHT or
+        are dropped if there is no cache. Skipped while the current layer still has prefetch_max_in_flight or
         more reads in flight, so guesses never hold up reads that are actually needed."""
-        if self.in_flight >= PREFETCH_MAX_IN_FLIGHT:
+        if self.prefetch_max_in_flight is not None and self.in_flight >= self.prefetch_max_in_flight:
             return
         for expert in experts:
             key = (layer, expert)

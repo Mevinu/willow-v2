@@ -84,6 +84,10 @@ class GGUFExpertStore(ExpertStore):
     the next layer: by then the last layer's output has been copied back, which waits for the GPU."""
 
     pack_format = "gguf"
+    # Always start the next layer's guessed reads. A GGUF expert is small (~2 MiB), so the guesses queue behind
+    # this layer's reads and finish while its experts and the next attention compute; capped, they were skipped
+    # on exactly the layers with the most misses.
+    prefetch_max_in_flight = None
 
     def __init__(self, pack_dir: str, cache_bytes: int = 0):
         super().__init__(pack_dir, cache_bytes)

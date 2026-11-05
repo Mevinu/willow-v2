@@ -8,7 +8,7 @@ Run a large Mixture-of-Experts (MoE) language model on a laptop that doesn't hav
 
 It's built and tuned for **[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)**: 35B parameters in total, about 3B used per token. The main format is a quantized **GGUF** file made by llama.cpp: the experts stay quantized on disk, so each token reads far less than with the original bf16 weights. The vision encoder and multi-token-prediction head aren't used; this is text only.
 
-The model I test on is **`Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`**, a Q4_K_M GGUF of a Qwen3.6-35B-A3B fine-tune. Q4_K_M mixes Q4_K and Q6_K, the two types with a fast path (see below). Any GGUF of the same architecture should work the same way.
+The model I test on is **[Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf](https://huggingface.co/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive)**, a Q4_K_M GGUF of a Qwen3.6-35B-A3B fine-tune. Q4_K_M mixes Q4_K and Q6_K, the two types with a fast path (see below). Any GGUF of the same architecture should work the same way.
 
 Supported:
 
@@ -40,7 +40,7 @@ The 4-bit formats come from private PyTorch functions, so a pack records the PyT
 
 ### On the GPU
 
-By default (when PyTorch can use Apple's GPU through MPS), `pack` stores the 4-bit experts in the layout of PyTorch's GPU 4-bit kernel, and `run` computes the experts on the GPU. The expert cache is then memory the CPU and GPU share (Apple Silicon has one pool of RAM for both), so each expert is read from the SSD straight into memory the GPU computes from, with no extra copy. Even with `--cache-gb 0`, there are 64 such slots (about 85 MB) to read into. Each layer's expert outputs are added up on the GPU and copied back once per layer. Everything else (attention, the router, the shared expert) still runs on the CPU.
+By default (when PyTorch can use Apple's GPU through MPS), `pack` stores the 4-bit experts in the layout of PyTorch's GPU 4-bit kernel, and `run` computes the experts on the GPU. The expert cache is then memory the CPU and GPU share (Apple Silicon has one pool of RAM for both), so each expert is read from the SSD straight into memory the GPU computes from, with no extra copy. Even with `--cache-gb 0`, there are 64 such slots (about 120 MiB for this model) to read into. Each layer's expert outputs are added up on the GPU and copied back once per layer. Everything else (attention, the router, the shared expert) still runs on the CPU.
 
 PyTorch has no Python API for shared GPU memory, so a small Objective-C++ helper (`gguf/mps_shared.mm`) is compiled with `clang++` the first time a GPU pack runs, into `gguf/build/`. This needs Xcode or its Command Line Tools (`xcode-select --install`). A pack's layout decides where its experts run, so to switch, rerun `pack` with `--gpu` or `--no-gpu`.
 
@@ -95,7 +95,7 @@ Options for `run`:
 | `--max-new-tokens N` | 2048 | Upper limit on the reply length. Generation stops earlier once the model finishes its answer. |
 | `--think` | off | Lets the model think before answering. This adds a lot of tokens. |
 | `--pack-dir DIR` | `<name>.expert_pack` (or `<model_dir>/expert_pack`) | Use a pack stored somewhere else. |
-| `--cache-gb N` | 0 | RAM for caching recently used experts. For a GPU pack, the cache is memory shared with the GPU, with at least 64 slots (about 85 MB) even at 0. For safetensors, leave it at 0 on a 16 GB machine: the OS file cache already does this, and an extra cache causes memory pressure that slows everything down. |
+| `--cache-gb N` | 0 | RAM for caching recently used experts. For a GPU pack, the cache is memory shared with the GPU, with at least 64 slots (about 120 MiB for this model) even at 0. For safetensors, leave it at 0 on a 16 GB machine: the OS file cache already does this, and an extra cache causes memory pressure that slows everything down. |
 | `--preload` / `--no-preload` | on | GGUF only: read each layer's most used 15% of experts (from the usage table) into the cache before generating. Needs `--cache-gb`. |
 
 Decoding is greedy: it always picks the most likely next token.
