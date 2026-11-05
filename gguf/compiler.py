@@ -58,11 +58,33 @@ def scan_experts(metadata: dict, tensors: dict):
     max_payload = max(sum(p[3] for p in parts) for parts in plan.values())
     return num_layers, num_experts, max_payload, plan, part_info
 
+def fuse_gate_up(plan: dict, part_info: dict):
+    """Turns each layer's separate gate and up parts into one gate_up part (gate rows, then up rows), so the
+    engine runs one matmul for both. ggml quant blocks never cross rows, so appending up's bytes to gate's is
+    a valid [2 * rows, k] tensor of the same type. Layers whose gate and up differ in type stay separate.
+    Returns (plan, part_info), with plan's parts as (part, [(path, offset, size), ...]): sources read back to back."""
+    fused_layers = set()
+    for layer in {l for l, _ in plan}:
+        gate, up = part_info.get(f"{layer}.gate"), part_info.get(f"{layer}.up")
+        if gate and up and gate == up:
+            fused_layers.add(layer)
+            part_info[f"{layer}.gate_up"] = {"shape": [2 * gate["shape"][0], gate["shape"][1]], "dtype": gate["dtype"]}
+            del part_info[f"{layer}.gate"], part_info[f"{layer}.up"]
+    fused_plan = {}
+    for (layer, expert), parts in plan.items():
+        sources = {part: (path, offset, size) for part, path, offset, size in parts}
+        if layer in fused_layers:
+            fused_plan[(layer, expert)] = [("gate_up", [sources["gate"], sources["up"]]), ("down", [sources["down"]])]
+        else:
+            fused_plan[(layer, expert)] = [(part, [src]) for part, src in sources.items()]
+    return fused_plan, part_info
+
 def compile_pack(gguf_path: str, out_dir: str = None):
     """Copies a GGUF model's expert tensors, still quantized, into experts.pack + manifest.json
-    (default: <model>.expert_pack/ next to the .gguf file). Q4_K and Q6_K parts are converted to layouts that
-    are cheap to run (see quants.PACK_LAYOUTS); other types are copied byte for byte."""
-    from .quants import PACK_LAYOUTS  # needs torch, which only GGUF packs need (for the conversions)
+    (default: <model>.expert_pack/ next to the .gguf file). gate and up are fused into one gate_up part, and
+    Q4_K and Q6_K parts are converted to int4, which runs without dequantizing (see quants.PACK_LAYOUTS);
+    other types are copied byte for byte."""
+    from .quants import INT4_ROW_MULTIPLE, PACK_LAYOUTS  # needs torch, which only GGUF packs need (for the conversions)
 
     out_dir = out_dir or default_pack_dir(gguf_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -71,18 +93,20 @@ def compile_pack(gguf_path: str, out_dir: str = None):
     num_layers, num_experts, _, plan, part_info = scan_experts(metadata, tensors)
     types = sorted({info["dtype"] for info in part_info.values()})
 
+    plan, part_info = fuse_gate_up(plan, part_info)
+
     converters, sizes = {}, {}
     for key, info in part_info.items():
-        if info["dtype"] in PACK_LAYOUTS:
+        if info["dtype"] in PACK_LAYOUTS and info["shape"][0] % INT4_ROW_MULTIPLE == 0:
             layout, nbytes, convert = PACK_LAYOUTS[info["dtype"]]
             converters[key] = functools.partial(convert, shape=tuple(info["shape"]))
             sizes[key] = nbytes(info["shape"])
             part_info[key] = {"shape": info["shape"], "dtype": layout, "source_dtype": info["dtype"]}
-    max_payload = max(sum(sizes.get(f"{layer}.{p[0]}", p[3]) for p in parts) for (layer, _), parts in plan.items())
+    max_payload = max(sum(sizes.get(f"{layer}.{part}", sum(src[2] for src in sources)) for part, sources in parts)
+                      for (layer, _), parts in plan.items())
     layouts = sorted({info["dtype"] for info in part_info.values()} - set(types))
     print(f"Found {num_layers} layers x {num_experts} experts, largest expert = {max_payload / 1024**2:.2f} MiB, "
           f"types = {', '.join(types)}" + (f" (stored as {', '.join(layouts)})" if layouts else ""))
-
     pack_path = os.path.join(out_dir, "experts.pack")
     manifest_path = os.path.join(out_dir, "manifest.json")
     build_converted_pack(plan, part_info, converters, pack_path, manifest_path, num_layers, num_experts, max_payload)
@@ -90,8 +114,9 @@ def compile_pack(gguf_path: str, out_dir: str = None):
 
 def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_path: str, manifest_path: str,
                          num_layers: int, num_experts: int, max_payload: int):
-    """Writes the same pack layout as safetensor.compiler.build_expert_pack (one 4KB-aligned block per expert),
-    but passes each part's bytes through converters["<layer>.<part>"] when there is one."""
+    """Writes the same pack layout as safetensor.compiler.build_expert_pack (one page-aligned block per expert),
+    but passes each part's bytes through converters["<layer>.<part>"] when there is one. plan's parts are
+    (part, [(path, offset, size), ...]), as fuse_gate_up returns them."""
     import torch
 
     stride = align_up(max_payload, PAGE_ALIGNMENT)
@@ -113,12 +138,15 @@ def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_pat
             for layer in range(num_layers):
                 for expert in range(num_experts):
                     parts, payload = {}, bytearray()
-                    for part, path, offset, size in plan[(layer, expert)]:
-                        if path not in fds:
-                            fds[path] = os.open(path, os.O_RDONLY)
-                        data = os.pread(fds[path], size, offset)
-                        if len(data) != size:
-                            raise IOError(f"Short read for {part} of expert {layer}_{expert} in {path}")
+                    for part, sources in plan[(layer, expert)]:
+                        data = b""
+                        for path, offset, size in sources:
+                            if path not in fds:
+                                fds[path] = os.open(path, os.O_RDONLY)
+                            chunk = os.pread(fds[path], size, offset)
+                            if len(chunk) != size:
+                                raise IOError(f"Short read for {part} of expert {layer}_{expert} in {path}")
+                            data += chunk
                         convert = converters.get(f"{layer}.{part}")
                         data = convert(data) if convert else data
                         parts[part] = {"offset": len(payload), "size": len(data)}

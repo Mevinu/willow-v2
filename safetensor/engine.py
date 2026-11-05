@@ -3,8 +3,8 @@ import math
 import json
 import time
 import threading
-from collections import OrderedDict, defaultdict, deque
-from concurrent.futures import Future, ThreadPoolExecutor
+from collections import OrderedDict, defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from itertools import islice
 
 import torch
@@ -78,6 +78,13 @@ def compute_inv_freq(cfg: dict, head_dim: int):
     inv_freq = (1.0 / (factor * pos_freqs)) * (1 - extrapolation_factor) + (1.0 / pos_freqs) * extrapolation_factor
     return inv_freq, attention_factor
 
+def expert_weights(parts: dict) -> tuple:
+    """An expert's parts by name -> (gate_up, down) when gate and up are fused into one
+    [2 * intermediate, hidden] matrix (gate rows first), else (gate, up, down)."""
+    if "gate_up" in parts:
+        return parts["gate_up"], parts["down"]
+    return parts["gate"], parts["up"], parts["down"]
+
 class ExpertStore:
     """Reads one expert's [gate | up | down] (or [gate_up | down]) block from the pack with a single aligned read.
     A layer's experts are read in parallel on a thread pool (os.preadv releases the GIL), so the SSD has many
@@ -108,29 +115,101 @@ class ExpertStore:
         self.lock = threading.Lock()
         self.in_flight = 0
         self.busy_since = 0.0
+        self.busy = set()     # (layer, expert) handed out by load_many and not yet consumed
+        self.inflight = {}    # (layer, expert) -> (future, token): prefetches not yet picked up
+        self.prefetches = 0       # prefetch reads started
+        self.prefetch_used = 0    # of those, ones load_many then asked for
 
     def load_many(self, layer: int, experts: list):
-        """Yields (expert, (gate, up, down)) in the given order. Reads for up to read_ahead experts are started
-        at once, and each expert is yielded as soon as its own read is done."""
+        """Starts loading a layer's experts and returns an iterator of (expert, weights), where weights is
+        (gate_up, down) or (gate, up, down). The reads for misses are submitted before this returns (up to
+        read_ahead of them; for a decode step, all), so the SSD works on them while the caller computes the
+        cache hits, which come first. Misses then come in the order their reads finish."""
+        keys = [(layer, expert) for expert in experts]
+        self.collect_prefetches(exclude=set(keys))
+        self.busy.update(keys)  # their cache entries must not be evicted until they have been consumed
+        hits, misses = [], []
+        for key in keys:
+            weights = self.lookup(key)
+            if weights is None and key in self.inflight and self.inflight[key][0].done():
+                future, token = self.inflight.pop(key)  # a prefetch that has already finished: as good as a hit
+                weights = future.result()
+                self.finish_read(key, weights, token)
+                self.prefetch_used += 1
+            if weights is not None:
+                hits.append((key[1], weights))
+            else:
+                misses.append(key[1])
+
+        reads = {}  # future -> (expert, token for finish_read)
         def start(expert):
             key = (layer, expert)
-            if key in self.cache:
-                self.cache.move_to_end(key)
-                self.hits += 1
-                return self.cache[key]
-            return self.pool.submit(self.read, layer, expert)
+            if key in self.inflight:  # prefetched, still reading
+                self.prefetch_used += 1
+                future, token = self.inflight.pop(key)
+            else:
+                future, token = self.start_read(layer, expert)
+            reads[future] = (expert, token)
 
-        pending = iter(experts)
-        queue = deque((expert, start(expert)) for expert in islice(pending, self.read_ahead))
-        while queue:
-            expert, weights = queue.popleft()
-            following = next(pending, None)
-            if following is not None:
-                queue.append((following, start(following)))
-            if isinstance(weights, Future):
-                weights = weights.result()
-                self.remember((layer, expert), weights)
-            yield expert, weights
+        pending = iter(misses)
+        for expert in islice(pending, self.read_ahead):
+            start(expert)
+        return self.results(layer, keys, hits, reads, pending, start)
+
+    def results(self, layer: int, keys: list, hits: list, reads: dict, pending, start):
+        try:
+            for expert, weights in hits:
+                yield expert, weights
+                self.busy.discard((layer, expert))
+            while reads:
+                done, _ = wait(reads, return_when=FIRST_COMPLETED)
+                for future in done:
+                    expert, token = reads.pop(future)
+                    weights = future.result()
+                    self.finish_read((layer, expert), weights, token)
+                    following = next(pending, None)
+                    if following is not None:
+                        start(following)
+                    yield expert, weights
+                    self.busy.discard((layer, expert))
+        finally:
+            self.busy.difference_update(keys)
+
+    def prefetch(self, layer: int, experts: list):
+        """Starts reading experts that will probably be needed soon, without waiting for them. load_many picks
+        up the reads it needs; ones it never asks for go into the cache once they finish."""
+        for expert in experts:
+            key = (layer, expert)
+            if key in self.cache or key in self.inflight:
+                continue
+            started = self.start_read(layer, expert, prefetch=True)
+            if started is None:
+                break
+            self.inflight[key] = started
+            self.prefetches += 1
+
+    def collect_prefetches(self, exclude: set = frozenset()):
+        """Moves finished prefetches nobody asked for into the cache. Runs on the main thread."""
+        for key, (future, token) in list(self.inflight.items()):
+            if key not in exclude and future.done():
+                del self.inflight[key]
+                self.finish_read(key, future.result(), token)
+
+    def lookup(self, key):
+        """Returns a cached expert's weights (marking it most recently used), or None."""
+        weights = self.cache.get(key)
+        if weights is not None:
+            self.cache.move_to_end(key)
+            self.hits += 1
+        return weights
+
+    def start_read(self, layer: int, expert: int, prefetch: bool = False):
+        """Submits a read to the pool. Returns (future, token passed to finish_read), or None to skip a prefetch."""
+        return self.pool.submit(self.read, layer, expert), None
+
+    def finish_read(self, key, weights, token):
+        """Called on the main thread once a read is done."""
+        self.remember(key, weights)
 
     def remember(self, key, weights):
         size = sum(t.numel() * t.element_size() for t in weights)
@@ -164,10 +243,7 @@ class ExpertStore:
             self.bytes_read += len(block)
 
         weights = {name: self.part_tensor(block, layer, name, part) for name, part in entry["parts"].items()}
-        if "gate_up" in weights:
-            # Fused [2 * intermediate, hidden]: gate rows first, then up rows
-            weights["gate"], weights["up"] = weights.pop("gate_up").chunk(2, dim=0)
-        return weights["gate"], weights["up"], weights["down"]
+        return expert_weights(weights)
 
     def part_tensor(self, block: bytearray, layer: int, name: str, part: dict) -> torch.Tensor:
         """Turns one part's bytes inside a read block into a weight tensor (no copy: it views the block)."""
@@ -184,6 +260,7 @@ class MoEEngine:
 
     prefix = "model."            # where the decoder's weights live in the checkpoint
     zero_centered_norm = False   # RMSNorm scales by (1 + w) instead of w
+    prefetch_top_k = 4           # next-layer experts to start reading early while decoding (0: off)
 
     def __init__(self, cfg: dict, eos_ids: set, weights: dict, experts: ExpertStore, tokenizer: Tokenizer):
         """cfg is the (text) config.json, and weights maps Hugging Face tensor names to every non-expert tensor.
@@ -295,7 +372,21 @@ class MoEEngine:
         self.timings[section] += now - since
         return now
 
-    def moe(self, x: torch.Tensor, layer: int) -> torch.Tensor:
+    def prefetch_next_layer(self, residual: torch.Tensor, layer: int):
+        """Guesses the next layer's experts by running its router on the current residual stream (it hasn't
+        been through this layer's experts or the next layer's attention yet, but usually picks many of the
+        same experts), and starts reading them so the SSD works while this layer and the next attention run.
+        Decode only: a prefill batch reads most experts anyway."""
+        following = layer + 1
+        if not self.prefetch_top_k or following >= self.num_layers or residual.shape[0] != 1:
+            return
+        t = time.perf_counter()
+        p = f"{self.prefix}layers.{following}"
+        logits = self.linear(self.rms_norm(residual, p + ".post_attention_layernorm.weight"), p + ".mlp.gate")
+        self.experts.prefetch(following, logits[0].topk(self.prefetch_top_k).indices.tolist())
+        self.tick("prefetch", t)
+
+    def moe(self, x: torch.Tensor, layer: int, residual: torch.Tensor = None) -> torch.Tensor:
         p = f"{self.prefix}layers.{layer}.mlp"
         t = time.perf_counter()
         router_logits = self.linear(x, p + ".gate")
@@ -304,18 +395,33 @@ class MoEEngine:
         if self.norm_topk_prob:
             routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
         routing_weights = routing_weights.to(x.dtype)
+        # Start this layer's reads first, so the guesses for the next layer queue up behind them
+        loads = self.experts.load_many(layer, selected.unique().tolist())
         t = self.tick("router", t)
+        if residual is not None:
+            self.prefetch_next_layer(residual, layer)
+            t = time.perf_counter()
 
-        out = torch.zeros_like(x)
-        # Read all needed experts in parallel, then run every token routed to each one as it arrives.
+        # Run every token routed to each expert as it arrives (cache hits first, then reads as they finish).
         # "expert load" is only the time spent waiting for a read that hasn't finished yet.
-        for expert, (gate_w, up_w, down_w) in self.experts.load_many(layer, selected.unique().tolist()):
+        results = []
+        for expert, weights in loads:
             t = self.tick("expert load", t)
             token_idx, slot = (selected == expert).nonzero(as_tuple=True)
             h = x[token_idx]
-            h = F.linear(F.silu(F.linear(h, gate_w)) * F.linear(h, up_w), down_w)
-            out.index_add_(0, token_idx, h * routing_weights[token_idx, slot, None])
+            if len(weights) == 2:  # fused gate_up: one matmul, then split its output
+                gate, up = F.linear(h, weights[0]).chunk(2, dim=-1)
+            else:
+                gate, up = F.linear(h, weights[0]), F.linear(h, weights[1])
+            h = F.linear(F.silu(gate) * up, weights[-1])
+            results.append((expert, token_idx, h * routing_weights[token_idx, slot, None]))
             t = self.tick("expert compute", t)
+        # Experts arrive in whatever order their reads finish; adding them up in a fixed order keeps the
+        # (bf16) output, and so greedy decoding, the same from run to run
+        out = torch.zeros_like(x)
+        for _, token_idx, h in sorted(results, key=lambda r: r[0]):
+            out.index_add_(0, token_idx, h)
+        self.tick("expert compute", t)
 
         # Shared expert (Qwen2-MoE / Qwen3.5-MoE): a dense MLP every token uses, scaled by a sigmoid gate
         sp = p + ".shared_expert"
@@ -336,7 +442,7 @@ class MoEEngine:
             t = time.perf_counter()
             x = x + self.token_mixer(self.rms_norm(x, p + ".input_layernorm.weight"), layer, cos, sin)
             self.tick(self.layer_types[layer].replace("_", " "), t)
-            x = x + self.moe(self.rms_norm(x, p + ".post_attention_layernorm.weight"), layer)
+            x = x + self.moe(self.rms_norm(x, p + ".post_attention_layernorm.weight"), layer, residual=x)
         self.position += len(token_ids)
         t = time.perf_counter()
         logits = F.linear(self.rms_norm(x, self.prefix + "norm.weight"), self.w("lm_head.weight"))
@@ -350,7 +456,7 @@ class MoEEngine:
         """Marks the start of a phase: resets the per-section timings and snapshots the I/O counters."""
         self.timings = defaultdict(float)
         e = self.experts
-        return time.perf_counter(), e.bytes_read, e.read_seconds, e.hits, e.reads
+        return time.perf_counter(), e.bytes_read, e.read_seconds, e.hits, e.reads, e.prefetches, e.prefetch_used
 
     def record_phase(self, name: str, tokens: int, start: tuple):
         now = time.perf_counter()
@@ -364,6 +470,8 @@ class MoEEngine:
             "read_seconds": e.read_seconds - start[2],
             "cache_hits": e.hits - start[3],
             "disk_reads": e.reads - start[4],
+            "prefetches": e.prefetches - start[5],
+            "prefetch_used": e.prefetch_used - start[6],
             "timings": timings,
         }
 
@@ -554,6 +662,9 @@ def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir
         print(f"{name + ':':9} {s['tokens']:4d} tokens in {s['seconds']:6.1f}s = {s['tokens'] / s['seconds']:6.2f} tok/s | "
               f"cache hits {hit_rate:3.0f}% | {gib:6.2f} GiB read ({gib / s['tokens']:.2f} GiB/token) | "
               f"disk {io_share:3.0f}% of time at {io_speed:.1f} GiB/s")
+        if s["prefetches"]:
+            print(f"{'':9} prefetch: {s['prefetches']} next-layer reads started, "
+                  f"{s['prefetch_used'] / s['prefetches'] * 100:.0f}% of them used")
     cache = engine.experts
     print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache_gb:.2f} GiB used, {len(cache.cache)} experts held")
 

@@ -5,7 +5,9 @@ import json
 import math
 import struct
 
-PAGE_ALIGNMENT = 4096  # Mandatory 4KB alignment for Linux O_DIRECT
+# 16KB: the VM page size on Apple Silicon (and a multiple of Linux O_DIRECT's 4KB). With F_NOCACHE, reads that
+# aren't aligned to whole 16KB pages go through a bounce buffer in the kernel.
+PAGE_ALIGNMENT = 16384
 
 # Matches both expert layouts:
 #   one tensor per expert:  model.layers.N.mlp.experts.M.gate_proj.weight      (Qwen3-MoE, OLMoE)
@@ -121,7 +123,7 @@ def build_expert_pack(
 ):
     """
     Reorganizes scattered MoE expert tensors into a single contiguous,
-    4096-byte page-aligned binary pack file for O_DIRECT streaming.
+    page-aligned (PAGE_ALIGNMENT) binary pack file for direct streaming reads.
 
     expert_plan maps (layer, expert) -> [(part_name, shard_path, byte_offset, byte_size), ...]
     giving the raw bytes of each part (e.g. gate/up/down) inside the source safetensors shards.
@@ -163,7 +165,7 @@ def build_expert_pack(
                     if payload_len > expert_stride:
                         raise ValueError(f"Expert payload ({payload_len}B) exceeds aligned stride ({expert_stride}B)")
 
-                    # 3. Pad with zeros to exact 4096-byte stride boundary
+                    # 3. Pad with zeros to the page-aligned stride
                     padding_len = expert_stride - payload_len
                     aligned_block = raw_payload + (b"\x00" * padding_len)
 

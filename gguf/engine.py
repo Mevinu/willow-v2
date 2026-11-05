@@ -1,16 +1,26 @@
 """Runs GGUF models (as made by llama.cpp's convert_hf_to_gguf.py) on the same model code as the safetensors
-engine. The non-expert weights are dequantized to bf16 at load and renamed to their Hugging Face names, undoing
-the changes llama.cpp's converter makes; the routed experts stay quantized in the pack. Q4_K experts are
-multiplied 4-bit with torch's int4 kernel, and other types are dequantized as each one is read."""
+engine. The non-expert weights are loaded at startup and renamed to their Hugging Face names, undoing the changes
+llama.cpp's converter makes: the big projection matrices (attention, linear attention, shared expert, lm_head)
+become 4-bit Int4Weights, and the rest (embeddings, routers, norms, conv) bf16 or float32. The routed experts stay
+quantized in the pack; int4 ones (all of them, for a Q4_K/Q6_K model) run on torch's int4 kernel, and other types
+are dequantized as each one is read."""
+import fcntl
+import math
+import mmap
 import os
 import re
+import sys
+import time
+from collections import OrderedDict
 
 import torch
 from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
 
-from safetensor.engine import ExpertStore, MoEEngine, Qwen35MoEEngine
+from safetensor.compiler import PAGE_ALIGNMENT, align_up
+from safetensor.engine import ExpertStore, MoEEngine, Qwen35MoEEngine, expert_weights
 from .compiler import EXPERT_RE, default_pack_dir, num_decoder_layers
-from .quants import PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize
+from .quants import (INT4_GROUP, INT4_ROW_MULTIPLE, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize,
+                     float_to_int4_parts, int4_nbytes, q4_k_int4_parts)
 from .reader import read_gguf
 
 ENGINES = {"qwen3moe": MoEEngine, "qwen35moe": Qwen35MoEEngine}
@@ -43,6 +53,13 @@ LAYER_NAMES = {
 GLOBAL_NAMES = {"token_embd.weight": "embed_tokens.weight", "output_norm.weight": "norm.weight"}
 LAYER_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 KEEP_FLOAT32 = (".linear_attn.A_log", ".linear_attn.dt_bias")  # the engine computes with these in float32
+# Projection matrices kept as 4-bit Int4Weights instead of bf16: about 3.5x less RAM, and faster to multiply.
+# The embedding table (one row read per token), routers, norms and conv weights stay bf16/float32, and so do
+# linear attention's in_proj_a/in_proj_b: they are tiny and set the recurrent state's decay, which is sensitive.
+INT4_WEIGHTS = re.compile(r"^lm_head\.weight$|\.self_attn\.[qkvo]_proj\.weight$"
+                          r"|\.linear_attn\.(in_proj_qkv|in_proj_z|out_proj)\.weight$"
+                          r"|\.mlp\.shared_expert\.(gate|up|down)_proj\.weight$")
+INT4_CHUNK_ROWS = 8192  # rows quantized at a time, so a big table like lm_head needs little temporary memory
 
 # Pre-tokenizer regexes, from the models' tokenizer.json (llama.cpp's tokenizer.ggml.pre names them)
 PRE_TOKENIZER_REGEXES = {
@@ -54,7 +71,15 @@ END_TOKENS = ("<|im_end|>", "<|endoftext|>")  # Qwen's generation_config.json st
 
 class GGUFExpertStore(ExpertStore):
     """Reads experts from a pack built from a GGUF file. INT4_G32 parts stay 4-bit (Int4Weight); the rest are
-    dequantized to bf16 on the read threads."""
+    dequantized to bf16 on the read threads.
+
+    With cache_bytes, recently used experts are kept in a slab: memory allocated once and cut into fixed slots, one
+    expert each, evicted least recently used first. Its size is exact (the weights live in the slots, and nothing
+    else is kept alive), and the OS file cache is turned off for the pack so the same bytes aren't held twice.
+    Layers whose slots are the same size share a slab, with the same number of slots per layer. A slot holds the
+    expert as it is computed with: int4 parts as stored, everything else as bf16, so a hit costs nothing. Layers
+    that are all int4 (every layer, in a pack of a Q4_K/Q6_K model) are read straight into their slot.
+    Only the main thread changes the cache; a read thread just fills the one slot it was given."""
 
     pack_format = "gguf"
 
@@ -67,6 +92,133 @@ class GGUFExpertStore(ExpertStore):
         if types & set(PACK_LAYOUTS):
             print(f"note: {pack_dir} stores {', '.join(sorted(types & set(PACK_LAYOUTS)))} experts as raw ggml "
                   "blocks, which are slow to dequantize; rerun `main.py pack` on this model to convert them")
+        if "INT8_G16" in types:
+            print(f"note: {pack_dir} stores Q6_K experts as int8, which is dequantized as each expert is read; rerun "
+                  "`main.py pack` on this model to store them as int4 (smaller, and run without dequantizing)")
+        self.slabs = {}  # layer -> its slab group (shared by layers with the same slot layout)
+        if cache_bytes:
+            self.build_slabs(cache_bytes)
+
+    def build_slabs(self, cache_bytes: int):
+        num_experts = self.manifest["num_experts"]
+        self.slot_parts = {}  # layer -> {part: (offset in slot, size in slot)}
+        self.direct = {}      # layer -> whether its slot is a byte-for-byte copy of the pack block
+        layouts = {}          # (direct, slot size) -> layers
+        for layer in range(self.manifest["num_layers"]):
+            entries = [self.manifest["experts"][f"{layer}_{e}"] for e in range(num_experts)]
+            parts, offset = {}, 0
+            for name in entries[0]["parts"]:
+                shape, type_name = self.parts[f"{layer}.{name}"]
+                size = int4_nbytes(shape) if type_name == "INT4_G32" else math.prod(shape) * 2
+                parts[name] = (offset, size)
+                offset += size
+            direct = all(self.parts[f"{layer}.{name}"][1] == "INT4_G32" for name in parts)
+            if direct:
+                assert all(e["parts"][n]["offset"] == parts[n][0] for e in entries for n in parts)
+                offset = max(e["read_length"] for e in entries)
+            self.slot_parts[layer], self.direct[layer] = parts, direct
+            layouts.setdefault((direct, align_up(offset, PAGE_ALIGNMENT)), []).append(layer)
+
+        per_layer = cache_bytes // sum(slot * len(layers) for (_, slot), layers in layouts.items())
+        if per_layer * min(len(layers) for layers in layouts.values()) < 2 * self.read_ahead:
+            print("note: --cache-gb is too small to be useful; cache off")
+            self.cache_bytes = 0
+            return
+        for (_, slot), layers in layouts.items():
+            count = per_layer * len(layers)
+            group = {"slab": mmap.mmap(-1, count * slot), "slot": slot, "free": list(range(count)),
+                     "lru": OrderedDict()}  # lru: (layer, expert) -> slot number, least recently used first
+            for layer in layers:
+                self.slabs[layer] = group
+        if sys.platform == "darwin":
+            fcntl.fcntl(self.fd, getattr(fcntl, "F_NOCACHE", 48), 1)
+        self.cache_bytes = sum(g["slot"] * len(g["free"]) for g in {id(g): g for g in self.slabs.values()}.values())
+
+    # ExpertStore.load_many and prefetch call these hooks; with a slab, a read goes straight into a free slot
+
+    def lookup(self, key):
+        if not self.slabs:
+            return super().lookup(key)
+        weights = self.cache.get(key)
+        if weights is not None:
+            self.slabs[key[0]]["lru"].move_to_end(key)
+            self.hits += 1
+        return weights
+
+    def start_read(self, layer: int, expert: int, prefetch: bool = False):
+        if not self.slabs:
+            return super().start_read(layer, expert, prefetch)
+        group = self.slabs[layer]
+        slot = self.take_slot(group)
+        if slot is None:
+            # Every slot is busy (a huge prefill batch): read without caching, unless it's only a guess
+            return None if prefetch else (self.pool.submit(self.read, layer, expert), None)
+        return self.pool.submit(self.fill, layer, expert, group, slot), slot
+
+    def finish_read(self, key, weights, slot):
+        if not self.slabs:
+            return super().finish_read(key, weights, slot)
+        if slot is not None:
+            group = self.slabs[key[0]]
+            group["lru"][key] = slot
+            self.cache[key] = weights
+            self.cached_bytes += group["slot"]
+
+    def take_slot(self, group: dict):
+        """A free slot, else the least recently used one not handed out by load_many (None if there is none).
+        Slots being filled are in neither the free list nor the LRU, so they are never taken."""
+        if group["free"]:
+            return group["free"].pop()
+        victim = next((key for key in group["lru"] if key not in self.busy), None)
+        if victim is None:
+            return None
+        del self.cache[victim]
+        self.cached_bytes -= group["slot"]
+        return group["lru"].pop(victim)
+
+    def fill(self, layer: int, expert: int, group: dict, slot: int):
+        """Reads one expert into its slot and returns its weights, viewing the slot. Runs on the thread pool."""
+        entry = self.manifest["experts"][f"{layer}_{expert}"]
+        slab, base = group["slab"], slot * group["slot"]
+        with memoryview(slab) as view:
+            if self.direct[layer]:
+                self.pread(view[base:base + entry["read_length"]], layer, expert, entry)
+            else:
+                block = bytearray(entry["read_length"])
+                self.pread(block, layer, expert, entry)
+                for name, part in entry["parts"].items():
+                    offset, size = self.slot_parts[layer][name]
+                    if self.parts[f"{layer}.{name}"][1] == "INT4_G32":
+                        view[base + offset:base + offset + size] = memoryview(block)[part["offset"]:part["offset"] + size]
+                    else:
+                        self.slot_tensor(slab, base, layer, name).copy_(self.part_tensor(block, layer, name, part))
+        return expert_weights({name: self.slot_tensor(slab, base, layer, name) for name in self.slot_parts[layer]})
+
+    def slot_tensor(self, slab: mmap.mmap, base: int, layer: int, name: str):
+        shape, type_name = self.parts[f"{layer}.{name}"]
+        offset = base + self.slot_parts[layer][name][0]
+        if type_name == "INT4_G32":
+            return Int4Weight.from_buffer(slab, offset, shape)
+        return torch.frombuffer(slab, dtype=torch.bfloat16, count=math.prod(shape), offset=offset).view(shape)
+
+    def pread(self, buf, layer: int, expert: int, entry: dict):
+        """os.preadv into buf, with the same I/O accounting as ExpertStore.read."""
+        with self.lock:
+            if self.in_flight == 0:
+                self.busy_since = time.perf_counter()
+            self.in_flight += 1
+        try:
+            got = os.preadv(self.fd, [buf], entry["file_offset"])
+        finally:
+            with self.lock:
+                self.in_flight -= 1
+                if self.in_flight == 0:
+                    self.read_seconds += time.perf_counter() - self.busy_since
+        if got != len(buf):
+            raise IOError(f"short read for expert {layer}_{expert}: {got} of {len(buf)} bytes")
+        with self.lock:
+            self.reads += 1
+            self.bytes_read += len(buf)
 
     def remember(self, key, weights):
         # Same as ExpertStore.remember, but sized with .nbytes, which Int4Weight has too
@@ -204,8 +356,45 @@ def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict):
         raise NotImplementedError(f"Don't know where GGUF tensor {gguf_name} goes")
     return [(p + LAYER_NAMES[rest], None)]
 
+def tensor_to_int4_weight(t: torch.Tensor) -> Int4Weight:
+    """A [rows, k] float tensor -> an INT4_G32 Int4Weight (min/max per group of 32), quantized in row chunks."""
+    packed, scales = [], []
+    for start in range(0, t.shape[0], INT4_CHUNK_ROWS):
+        q, sz = float_to_int4_parts(t[start:start + INT4_CHUNK_ROWS])
+        packed.append(torch._convert_weight_to_int4pack_for_cpu(q, 1))
+        scales.append(sz.to(torch.bfloat16))
+    return Int4Weight(torch.cat(packed), torch.cat(scales, dim=1).contiguous())
+
+def ggml_to_int4_weight(raw: bytearray, type_name: str, shape: tuple, rows: slice = None) -> Int4Weight:
+    """A 2D ggml tensor's bytes (optionally just some of its rows) -> an Int4Weight, a chunk of rows at a time
+    (quant blocks never cross rows). Q4_K converts exactly; other types are dequantized and requantized."""
+    num_rows, k = shape
+    start, stop, _ = (rows or slice(None)).indices(num_rows)
+    row_bytes = len(raw) // num_rows
+    packed, scales = [], []
+    with memoryview(raw) as view:
+        for r in range(start, stop, INT4_CHUNK_ROWS):
+            n = min(INT4_CHUNK_ROWS, stop - r)
+            chunk = view[r * row_bytes:(r + n) * row_bytes]
+            if type_name == "Q4_K":
+                q, sz = q4_k_int4_parts(chunk, (n, k))
+            else:
+                q, sz = float_to_int4_parts(dequantize(chunk, type_name, (n, k), torch.float32))
+            packed.append(torch._convert_weight_to_int4pack_for_cpu(q, 1))
+            scales.append(sz.to(torch.bfloat16))
+    return Int4Weight(torch.cat(packed), torch.cat(scales, dim=1).contiguous())
+
+def wants_int4(name: str, gguf_name: str, t, rows: slice, tensors: dict) -> bool:
+    if not INT4_WEIGHTS.search(name) or len(t.shape) != 2:
+        return False
+    if gguf_name.removesuffix(".weight") + ".bias" in tensors:
+        return False  # Int4Weight's F.linear has no bias
+    start, stop, _ = (rows or slice(None)).indices(t.shape[0])
+    return (t.shape[1] % INT4_GROUP == 0 and start % INT4_ROW_MULTIPLE == 0
+            and (stop - start) % INT4_ROW_MULTIPLE == 0)
+
 def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
-    """Reads and dequantizes every non-expert tensor. Returns {Hugging Face name: tensor}, all resident in RAM."""
+    """Reads every non-expert tensor. Returns {Hugging Face name: tensor or Int4Weight}, all resident in RAM."""
     weights = {}
     fds = {}
     try:
@@ -220,8 +409,16 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
                 raise IOError(f"short read for {gguf_name} in {t.path}")
             for name, rows in targets:
                 # Tensors that need the converter's changes undone go through float32; the rest (including the
-                # big embedding and output tables) dequantize straight to bf16
+                # big embedding and output tables) dequantize straight to bf16 (or int4)
                 fix = arch == "qwen35moe" and (".linear_attn." in name or name.endswith(("norm.weight", "_gate.weight")))
+                if wants_int4(name, gguf_name, t, rows, tensors):
+                    if not fix:
+                        weights[name] = ggml_to_int4_weight(raw, t.type, t.shape, rows)
+                        continue
+                    tensor = dequantize(raw, t.type, t.shape, torch.float32)
+                    tensor = tensor[rows] if rows is not None else tensor
+                    weights[name] = tensor_to_int4_weight(fix_qwen35_tensor(name, tensor, cfg))
+                    continue
                 keep_float32 = name.endswith(KEEP_FLOAT32)
                 tensor = dequantize(raw, t.type, t.shape, torch.float32 if fix or keep_float32 else torch.bfloat16)
                 if rows is not None:
@@ -232,6 +429,10 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
     finally:
         for fd in fds.values():
             os.close(fd)
+    embed = weights.get(prefix + "embed_tokens.weight")
+    if "lm_head.weight" not in weights and embed is not None and embed.shape[0] % INT4_ROW_MULTIPLE == 0:
+        # Tied embeddings: the table stays bf16 for lookups, and lm_head gets its own int4 copy
+        weights["lm_head.weight"] = tensor_to_int4_weight(embed)
     return weights
 
 def build_tokenizer(metadata: dict) -> Tokenizer:

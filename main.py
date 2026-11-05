@@ -7,7 +7,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run large MoE models by streaming their experts from SSD")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    pack = commands.add_parser("pack", help="Compile a model's MoE expert weights into a 4KB-aligned pack file")
+    pack = commands.add_parser("pack", help="Compile a model's MoE expert weights into a 16KB-aligned pack file")
     pack.add_argument("model", help="Hugging Face model folder containing .safetensors files, or a .gguf file "
                                     "(for a split GGUF, any one of its files)")
     pack.add_argument("--out-dir", default=None,
