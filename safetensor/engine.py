@@ -569,13 +569,14 @@ class MoEEngine:
         else:
             both = torch.cat((selected.flatten(), guess)).cpu()
             selected, guess = both[:selected.numel()].view(selected.shape), both[selected.numel():].tolist()
+        t = self.tick("gpu wait", t)
         self.keep_alive = []
         self.experts.record_usage(layer, selected)
         # Start this layer's reads first, so the guesses for the next layer queue up behind them
         loads = self.experts.load_many(layer, selected.unique().tolist())
         if guess is not None:
             self.experts.prefetch(layer + 1, guess)
-        t = self.tick("router", t)
+        t = self.tick("read setup", t)
 
         # Run every token routed to each expert as it arrives (cache hits first, then reads as they finish).
         # "expert load" is only the time spent waiting for a read that hasn't finished yet.

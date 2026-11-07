@@ -100,7 +100,7 @@ Options for `run`:
 | `--cache-gb N` | 0 | RAM for caching recently used experts. For a GPU pack, the cache is memory shared with the GPU, with at least 64 slots (about 120 MiB for this model) even at 0. For safetensors, leave it at 0 on a 16 GB machine: the OS file cache already does this, and an extra cache causes memory pressure that slows everything down. |
 | `--preload` / `--no-preload` | on | GGUF only: read each layer's most used 15% of experts (from the usage table) into the cache before generating. Needs `--cache-gb`. |
 | `--gpu-backbone` / `--no-gpu-backbone` | on | GGUF with a GPU pack only: also run attention, the routers, the shared experts and the output layer on the GPU. `--no-gpu-backbone` keeps them on the CPU. |
-| `--sync-timings` | off | Wait for the GPU at every section boundary, so `decode time per token, by section` shows where GPU time goes. Slower. Without it, GPU work runs in the background and is counted in whichever section next waits for it (mostly `router`). |
+| `--sync-timings` | off | Wait for the GPU at every section boundary, so `decode time per token, by section` shows where GPU time goes. Slower. Without it, GPU work runs in the background and is counted in whichever section next waits for it (mostly `gpu wait`, where each layer waits to get its expert choices back). |
 
 Decoding is greedy: it always picks the most likely next token.
 
