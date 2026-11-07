@@ -67,6 +67,11 @@ def route(router_logits: torch.Tensor, top_k: int, normalize: bool):
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     return routing_weights.to(router_logits.dtype), selected
 
+def expert_gate(gate_up: torch.Tensor) -> torch.Tensor:
+    """A routed expert's fused [gate | up] output -> the input of its down matmul."""
+    gate, up = gate_up.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
 def shared_expert(x, gate_w, up_w, down_w, shared_gate_w) -> torch.Tensor:
     """Qwen2-MoE / Qwen3.5-MoE: a dense MLP every token uses, scaled by a sigmoid gate."""
     h = F.linear(F.silu(F.linear(x, gate_w)) * F.linear(x, up_w), down_w)
@@ -106,7 +111,8 @@ class Ops:
     decoding. Compiled for fixed shapes only (torch 2.8's GPU compiler fails on shapes that vary), so a prefill
     batch, whose length varies, runs them as they are; decode steps all have the same shapes (the KV cache grows
     in KV_BLOCK steps, each compiled once)."""
-    NAMES = ("rms_norm", "apply_rope", "attention_core", "route", "shared_expert", "linear_attention_step")
+    NAMES = ("rms_norm", "apply_rope", "attention_core", "route", "expert_gate", "shared_expert",
+             "linear_attention_step")
 
     def __init__(self, compile: bool):
         self.compiled = compile
@@ -534,6 +540,19 @@ class MoEEngine:
         logits = self.linear(self.rms_norm(residual, p + ".post_attention_layernorm.weight"), p + ".mlp.gate")
         return logits[0].topk(self.prefetch_top_k).indices
 
+    def combine_decode_experts(self, outputs: dict, selected: torch.Tensor, routing_weights: torch.Tensor):
+        """Weights one decode token's expert outputs and adds them up, in expert order like the general path in moe,
+        for the same bf16 result. Not compiled: a fused kernel skips the rounding between these steps, which changes
+        the output."""
+        order = selected[0].argsort()
+        self.keep_alive.append(order)
+        scales = routing_weights[0, order.to(routing_weights.device, non_blocking=True), None, None]
+        parts = (torch.stack([outputs[expert] for expert in sorted(outputs)]) * scales).unbind(0)
+        total = parts[0]
+        for part in parts[1:]:
+            total = total + part
+        return total
+
     def moe(self, x: torch.Tensor, layer: int, residual: torch.Tensor = None) -> torch.Tensor:
         p = f"{self.prefix}layers.{layer}.mlp"
         t = time.perf_counter()
@@ -565,9 +584,17 @@ class MoEEngine:
         # Copies to the GPU don't wait (a waiting copy waits for all queued GPU work: ~0.2 ms each), so their CPU
         # sources are kept in self.keep_alive until the GPU's next wait (the copy back below, or the next layer's
         # `selected.cpu()`), by which time they have all run.
+        # A decode token whose hidden state and fused expert are all on the GPU skips the per-expert indexing (the
+        # one token is every expert's input), which issues far fewer GPU ops. See combine_decode_experts.
         results, on_device = [], {x.device: (x, routing_weights)}
+        decode_outputs = {}  # expert -> its output before the routing weight
+        fast_decode = self.ops.compiled and self.ops.decoding
         for expert, weights in loads:
             t = self.tick("expert load", t)
+            if fast_decode and len(weights) == 2 and all(w.device.type == x.device.type for w in weights):
+                decode_outputs[expert] = F.linear(self.ops.expert_gate(F.linear(x, weights[0])), weights[1])
+                t = self.tick("expert compute", t)
+                continue
             token_idx, slot = (selected == expert).nonzero(as_tuple=True)
             device = weights[0].device if all(w.device == weights[0].device for w in weights) else x.device
             if device not in on_device:  # this layer's input and routing weights, copied there once
@@ -587,16 +614,22 @@ class MoEEngine:
             h = F.linear(F.silu(gate) * up, weights[-1])
             results.append((expert, token_idx, h * scale))
             t = self.tick("expert compute", t)
-        # Experts arrive in whatever order their reads finish; adding them up in a fixed order keeps the
-        # (bf16) output, and so greedy decoding, the same from run to run
-        sums = {}
-        for _, token_idx, h in sorted(results, key=lambda r: r[0]):
-            if h.device not in sums:
-                sums[h.device] = torch.zeros_like(x, device=h.device)
-            sums[h.device].index_add_(0, token_idx, h)
-        out = torch.zeros_like(x)
-        for total in sums.values():
-            out += total.to(x.device)
+        if decode_outputs and not results:
+            out = self.combine_decode_experts(decode_outputs, selected, routing_weights)
+        else:
+            for expert, h in decode_outputs.items():  # a layer that also has an expert the fast path can't run
+                token_idx, slot = (idx.to(x.device) for idx in (selected == expert).nonzero(as_tuple=True))
+                results.append((expert, token_idx, h * routing_weights[token_idx, slot, None]))
+            # Experts arrive in whatever order their reads finish; adding them up in a fixed order keeps the
+            # (bf16) output, and so greedy decoding, the same from run to run
+            sums = {}
+            for _, token_idx, h in sorted(results, key=lambda r: r[0]):
+                if h.device not in sums:
+                    sums[h.device] = torch.zeros_like(x, device=h.device)
+                sums[h.device].index_add_(0, token_idx, h)
+            out = torch.zeros_like(x)
+            for total in sums.values():
+                out += total.to(x.device)
         self.tick("expert compute", t)
 
         sp = p + ".shared_expert"
