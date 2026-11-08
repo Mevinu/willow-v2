@@ -3,6 +3,30 @@ import argparse
 def is_gguf(model: str) -> bool:
     return model.endswith(".gguf")
 
+def add_run_options(command):
+    """The options `run` and `chat` share."""
+    command.add_argument("--max-new-tokens", type=int, default=2048,
+                         help="upper limit (per reply, for chat); generation stops earlier when the model emits an "
+                              "end token")
+    command.add_argument("--pack-dir", default=None, help="Default: where `main.py pack` writes it")
+    command.add_argument("--think", action="store_true", help="Let chat models think before answering")
+    command.add_argument("--cache-gb", type=float, default=0,
+                         help="GiB of RAM for caching recently used experts (default: 0, off; the OS file cache "
+                              "still keeps recently read experts in spare RAM). Needed for --preload")
+    command.add_argument("--preload", action=argparse.BooleanOptionalAction, default=False,
+                         help="For .gguf: read each layer's most used 15%% of experts (from earlier runs) into the "
+                              "cache before generating (needs --cache-gb)")
+    command.add_argument("--gpu-backbone", action=argparse.BooleanOptionalAction, default=True,
+                         help="For .gguf with a GPU pack: also run attention, the router, the shared expert and the "
+                              "output layer on the GPU (default: on; --no-gpu-backbone keeps them on the CPU)")
+    command.add_argument("--sync-timings", action="store_true",
+                         help="Wait for the GPU at each section boundary, so 'decode time per token, by section' "
+                              "shows where GPU time goes (slower; without it, GPU work is counted wherever the CPU "
+                              "next waits)")
+    command.add_argument("--min-expert-weight", type=float, default=0.0,
+                         help="For .gguf: skip routed experts below this routing weight, e.g. 0.02 (default: 0, "
+                              "off). Faster, but it changes the output and can lower its quality")
+
 def main():
     parser = argparse.ArgumentParser(description="Run large MoE models by streaming their experts from SSD")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -13,29 +37,18 @@ def main():
     pack.add_argument("--out-dir", default=None,
                       help="Where to write the pack (default: <model_dir>/expert_pack, or <model>.expert_pack "
                            "next to a .gguf file)")
+    pack.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=None,
+                      help="For .gguf: store the int4 experts in the GPU (MPS) kernel's format so they run on the "
+                           "GPU (default: on when torch can use MPS; --no-gpu keeps them on the CPU)")
 
     run = commands.add_parser("run", help="Generate text from a prompt, streaming experts from the pack")
     run.add_argument("model", help="Model folder or .gguf file (the one `main.py pack` was run on)")
     run.add_argument("prompt")
-    run.add_argument("--max-new-tokens", type=int, default=2048,
-                     help="upper limit; generation stops earlier when the model emits an end token")
-    run.add_argument("--pack-dir", default=None, help="Default: where `main.py pack` writes it")
-    run.add_argument("--think", action="store_true", help="Let chat models think before answering")
-    run.add_argument("--cache-gb", type=float, default=0,
-                     help="GiB of RAM for caching recently used experts (default: 0, off; the OS file cache "
-                          "still keeps recently read experts in spare RAM). Needed for --preload")
-    run.add_argument("--preload", action=argparse.BooleanOptionalAction, default=False,
-                     help="For .gguf: read each layer's most used 15%% of experts (from earlier runs) into the "
-                          "cache before generating (needs --cache-gb)")
-    run.add_argument("--gpu-backbone", action=argparse.BooleanOptionalAction, default=True,
-                     help="For .gguf with a GPU pack: also run attention, the router, the shared expert and the output "
-                          "layer on the GPU (default: on; --no-gpu-backbone keeps them on the CPU)")
-    run.add_argument("--sync-timings", action="store_true",
-                     help="Wait for the GPU at each section boundary, so 'decode time per token, by section' shows "
-                          "where GPU time goes (slower; without it, GPU work is counted wherever the CPU next waits)")
-    pack.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=None,
-                      help="For .gguf: store the int4 experts in the GPU (MPS) kernel's format so they run on the "
-                           "GPU (default: on when torch can use MPS; --no-gpu keeps them on the CPU)")
+    add_run_options(run)
+
+    chat = commands.add_parser("chat", help="Chat with the model; it remembers the conversation (Qwen3.5/3.6)")
+    chat.add_argument("model", help="Model folder or .gguf file (the one `main.py pack` was run on)")
+    add_run_options(chat)
     args = parser.parse_args()
 
     if args.command == "pack":
@@ -45,17 +58,22 @@ def main():
         else:
             from safetensor.compiler import compile_pack
             compile_pack(args.model, args.out_dir)
+        return
+
+    # Imported here so `pack` works without torch installed
+    from safetensor.engine import run_chat, run_prompt
+    if is_gguf(args.model):
+        from functools import partial
+        from gguf.engine import load_engine
+        load_engine = partial(load_engine, preload=args.preload, gpu_backbone=args.gpu_backbone,
+                              sync_timings=args.sync_timings, min_expert_weight=args.min_expert_weight)
     else:
-        # Imported here so `pack` works without torch installed
-        from safetensor.engine import run_prompt
-        if is_gguf(args.model):
-            from functools import partial
-            from gguf.engine import load_engine
-            load_engine = partial(load_engine, preload=args.preload, gpu_backbone=args.gpu_backbone,
-                                  sync_timings=args.sync_timings)
-        else:
-            from safetensor.engine import load_engine
-        run_prompt(args.model, args.prompt, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb, load_engine)
+        from safetensor.engine import load_engine
+    if args.command == "chat":
+        run_chat(args.model, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb, load_engine)
+    else:
+        run_prompt(args.model, args.prompt, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb,
+                   load_engine)
 
 if __name__ == "__main__":
     main()

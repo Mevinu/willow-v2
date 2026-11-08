@@ -83,6 +83,14 @@ With a 4 GiB expert cache, preloaded from the usage table of earlier runs:
 .venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf "Write a short poem about a lazy cat." --cache-gb 4
 ```
 
+Chat, keeping the conversation in context (Qwen3.5/3.6 models):
+
+```bash
+.venv/bin/python main.py chat ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf --cache-gb 1
+```
+
+The model loads once, then you type messages at the `>` prompt. It keeps the whole conversation in its caches, so each reply only has to read your new message, not the conversation again. `/reset` starts a new conversation, and `/exit` or Ctrl-D quits. Ctrl-C also quits, even mid-reply, since a reply cut off halfway leaves the caches half-updated. After each reply it prints that reply's speed and the conversation's length in tokens.
+
 Options for `pack`:
 
 | Option | Default | What it does |
@@ -90,7 +98,7 @@ Options for `pack`:
 | `--out-dir DIR` | `<name>.expert_pack` (or `<model_dir>/expert_pack`) | Where to write the pack. |
 | `--gpu` / `--no-gpu` | on when PyTorch can use MPS | GGUF only: store the 4-bit experts so they run on the GPU. `--no-gpu` keeps them on the CPU. |
 
-Options for `run`:
+Options for `run` and `chat` (`chat` takes no prompt, and `--max-new-tokens` applies to each reply):
 
 | Option | Default | What it does |
 |---|---|---|
@@ -100,6 +108,7 @@ Options for `run`:
 | `--cache-gb N` | 0 | RAM for caching recently used experts. For a GPU pack, the cache is memory shared with the GPU, with at least 64 slots (about 120 MiB for this model) even at 0. For safetensors, leave it at 0 on a 16 GB machine: the OS file cache already does this, and an extra cache causes memory pressure that slows everything down. |
 | `--preload` / `--no-preload` | on | GGUF only: read each layer's most used 15% of experts (from the usage table) into the cache before generating. Needs `--cache-gb`. |
 | `--gpu-backbone` / `--no-gpu-backbone` | on | GGUF with a GPU pack only: also run attention, the routers, the shared experts and the output layer on the GPU. `--no-gpu-backbone` keeps them on the CPU. |
+| `--min-expert-weight W` | 0 (off) | GGUF only: skip routed experts below routing weight `W`, e.g. `0.02`, keeping each token's top expert and scaling the other weights back up. Faster, but it changes the output and can lower its quality. The stats show how many were skipped. |
 | `--sync-timings` | off | Wait for the GPU at every section boundary, so `decode time per token, by section` shows where GPU time goes. Slower. Without it, GPU work runs in the background and is counted in whichever section next waits for it (mostly `gpu wait`, where each layer waits to get its expert choices back). |
 
 Decoding is greedy: it always picks the most likely next token.

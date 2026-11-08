@@ -539,11 +539,12 @@ def build_tokenizer(metadata: dict) -> Tokenizer:
     return tokenizer
 
 def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, preload: bool = True,
-                gpu_backbone: bool = True, sync_timings: bool = False) -> MoEEngine:
+                gpu_backbone: bool = True, sync_timings: bool = False, min_expert_weight: float = 0.0) -> MoEEngine:
     """cache_gb None or 0 (no --cache-gb) turns the expert cache off. preload reads the most used experts into
     the cache first (see GGUFExpertStore.preload). With a GPU pack, gpu_backbone also runs everything else
     (attention, the router, the shared expert, the output layer) on the GPU. sync_timings makes the per-section
-    decode times real when the GPU is used, at some cost in speed (see MoEEngine.tick)."""
+    decode times real when the GPU is used, at some cost in speed (see MoEEngine.tick). min_expert_weight skips
+    routed experts below that weight (see MoEEngine.skip_small_experts)."""
     metadata, tensors = read_gguf(gguf_path)
     arch = metadata.get("general.architecture")
     if arch not in ENGINES:
@@ -564,5 +565,6 @@ def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, pr
     device = "mps" if experts.gpu and gpu_backbone else "cpu"
     engine = engine_class(cfg, eos_ids, weights, experts, tokenizer, device)
     engine.sync_timings = sync_timings
+    engine.min_expert_weight = min_expert_weight
     print(f"experts on the {'GPU' if experts.gpu else 'CPU'}, the rest on the {'GPU' if device == 'mps' else 'CPU'}")
     return engine

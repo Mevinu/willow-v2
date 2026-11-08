@@ -402,6 +402,8 @@ class MoEEngine:
         self.device = torch.device(device)
         self.ops = Ops(compile=self.device.type == "mps")
         self.sync_timings = False  # wait for the GPU at every section boundary, so the per-section times are real
+        self.min_expert_weight = 0.0  # skip routed experts below this routing weight (0: off; see skip_small_experts)
+        self.experts_routed = self.experts_skipped = 0  # while decoding, when skipping is on
         self.keep_alive = []       # CPU sources of non-blocking GPU copies, kept until the GPU has run them
         if self.device.type != "cpu":
             moved = {}  # tied tensors (lm_head = embed_tokens) are moved once
@@ -538,13 +540,35 @@ class MoEEngine:
             return None
         p = f"{self.prefix}layers.{following}"
         logits = self.linear(self.rms_norm(residual, p + ".post_attention_layernorm.weight"), p + ".mlp.gate")
-        return logits[0].topk(self.prefetch_top_k).indices
+        top = logits[0].topk(self.prefetch_top_k)
+        if self.min_expert_weight:
+            self.guess_weights = F.softmax(top.values, dim=-1, dtype=torch.float32)
+        return top.indices
+
+    def skip_small_experts(self, routing_weights: torch.Tensor, selected: torch.Tensor, guess):
+        """Drops routed experts below min_expert_weight, trading some accuracy for fewer reads and matmuls. Each
+        token keeps its top expert, and its remaining weights are scaled back up to the same total. A skipped entry
+        of selected becomes -1. Guesses for the next layer below the threshold are dropped too, so they aren't read.
+        Returns (routing_weights, selected, guess)."""
+        keep = routing_weights.float().cpu() >= self.min_expert_weight
+        keep[:, 0] = True  # topk sorts by weight, so this is the top expert
+        if self.ops.decoding:
+            self.experts_routed += keep.numel()
+            self.experts_skipped += keep.numel() - int(keep.sum())
+        if guess is not None:
+            guess = [expert for expert, weight in zip(guess, self.guess_weights.cpu().tolist())
+                     if weight >= self.min_expert_weight]
+        self.keep_alive.append(keep)
+        kept = routing_weights * keep.to(routing_weights.device, non_blocking=routing_weights.device.type != "cpu")
+        kept = kept * (routing_weights.sum(dim=-1, keepdim=True) / kept.sum(dim=-1, keepdim=True))
+        return kept, selected.masked_fill(~keep, -1), guess
 
     def combine_decode_experts(self, outputs: dict, selected: torch.Tensor, routing_weights: torch.Tensor):
         """Weights one decode token's expert outputs and adds them up, in expert order like the general path in moe,
         for the same bf16 result. Not compiled: a fused kernel skips the rounding between these steps, which changes
         the output."""
         order = selected[0].argsort()
+        order = order[selected[0, order] >= 0]  # leaves out experts skip_small_experts dropped
         self.keep_alive.append(order)
         scales = routing_weights[0, order.to(routing_weights.device, non_blocking=True), None, None]
         parts = (torch.stack([outputs[expert] for expert in sorted(outputs)]) * scales).unbind(0)
@@ -571,9 +595,12 @@ class MoEEngine:
             selected, guess = both[:selected.numel()].view(selected.shape), both[selected.numel():].tolist()
         t = self.tick("gpu wait", t)
         self.keep_alive = []
-        self.experts.record_usage(layer, selected)
+        if self.min_expert_weight:
+            routing_weights, selected, guess = self.skip_small_experts(routing_weights, selected, guess)
+        used = selected[selected >= 0]
+        self.experts.record_usage(layer, used)
         # Start this layer's reads first, so the guesses for the next layer queue up behind them
-        loads = self.experts.load_many(layer, selected.unique().tolist())
+        loads = self.experts.load_many(layer, used.unique().tolist())
         if guess is not None:
             self.experts.prefetch(layer + 1, guess)
         t = self.tick("read setup", t)
@@ -686,10 +713,16 @@ class MoEEngine:
         }
 
     def generate(self, prompt: str, max_new_tokens: int = 100, stream: bool = False) -> list:
-        """Greedy decoding. Returns prompt + generated token ids; timings land in self.stats."""
+        """Greedy decoding from a fresh start. Returns prompt + generated token ids; timings land in self.stats."""
         self.reset()
+        return self.continue_with(self.prompt_ids(prompt), max_new_tokens, stream)
+
+    def continue_with(self, ids: list, max_new_tokens: int = 100, stream: bool = False) -> list:
+        """Runs ids through the model after everything it has already seen (the caches are kept, so a chat only
+        processes each new message), then decodes greedily. Returns ids + generated token ids; timings land in
+        self.stats. Stopping on an end token doesn't run that token through the model."""
         self.stats = {}
-        ids = self.prompt_ids(prompt)
+        ids = list(ids)
         num_prompt = len(ids)
         printed = ""
         start = self.io_snapshot()
@@ -699,6 +732,7 @@ class MoEEngine:
         # Decode phase: each step forwards the previous token. The first token comes from the prefill logits,
         # so the timed decode tokens are the forward passes after it.
         start = self.io_snapshot()
+        self.experts_routed = self.experts_skipped = 0
         decode_steps = 0
         for _ in range(max_new_tokens):
             next_id = int(logits[-1].argmax())
@@ -812,8 +846,10 @@ class Qwen35MoEEngine(MoEEngine):
         return torch.stack(outputs)
 
     def prompt_ids(self, prompt: str) -> list:
-        # Qwen chat format; an empty think block turns thinking off
-        text = f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+        # Qwen chat format; an empty think block turns thinking off. Mid-chat (position > 0), it first closes the
+        # previous reply: continue_with stops on its end token without running it through the model.
+        text = "<|im_end|>\n" if self.position else ""
+        text += f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         text += "<think>\n" if self.think else "<think>\n\n</think>\n\n"
         return self.tokenizer.encode(text, add_special_tokens=False).ids
 
@@ -854,6 +890,40 @@ def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = None) ->
     tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
     return engine_class(cfg, eos_ids, weights, experts, tokenizer)
 
+def run_chat(model_dir: str, max_new_tokens: int = 2048, pack_dir: str = None, think: bool = False,
+             cache_gb: float = None, load=load_engine):
+    """An interactive chat (`main.py chat`). The model keeps the whole conversation in its caches, so each reply
+    only processes the new message. /reset starts a new conversation; /exit, Ctrl-D or Ctrl-C quits."""
+    engine = load(model_dir, pack_dir, cache_gb)
+    if not isinstance(engine, Qwen35MoEEngine):
+        raise SystemExit("chat needs a Qwen3.5/3.6 model (it uses their chat format)")
+    engine.think = think
+    print("\nchat: type a message and press Enter. /reset starts over, /exit (or Ctrl-D) quits.")
+    try:
+        while True:
+            try:
+                message = input("\n> ").strip()
+            except EOFError:
+                break
+            if message == "/exit":
+                break
+            if message == "/reset":
+                engine.reset()
+                print("(new conversation)")
+                continue
+            if not message:
+                continue
+            print()
+            engine.continue_with(engine.prompt_ids(message), max_new_tokens, stream=True)
+            read, reply = engine.stats["prefill"], engine.stats["decode"]
+            speed = f" at {reply['tokens'] / reply['seconds']:.1f} tok/s" if reply["tokens"] else ""
+            print(f"\n[{reply['tokens']} tokens{speed}; read your message in {read['seconds']:.1f}s; "
+                  f"conversation so far: {engine.position} tokens]")
+    except KeyboardInterrupt:  # mid-reply, this leaves the caches half-updated, so it quits rather than continues
+        print()
+    finally:
+        engine.experts.save_usage()
+
 def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir: str = None,
                think: bool = False, cache_gb: float = None, load=load_engine):
     """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`).
@@ -887,6 +957,9 @@ def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir
     cache = engine.experts
     print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache.cache_bytes / 1024**3:.2f} GiB used, "
           f"{len(cache.cache)} experts held")
+    if engine.experts_routed:
+        print(f"skipped:  {engine.experts_skipped} of {engine.experts_routed} routed experts while decoding "
+              f"({engine.experts_skipped / engine.experts_routed * 100:.0f}%), weight below {engine.min_expert_weight}")
 
     decode = engine.stats.get("decode")
     if decode and decode["tokens"]:
