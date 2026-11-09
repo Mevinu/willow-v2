@@ -19,7 +19,8 @@ from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalize
 from safetensor.compiler import PAGE_ALIGNMENT, align_up
 from safetensor.engine import ExpertStore, MoEEngine, Qwen35MoEEngine, expert_weights
 from .compiler import EXPERT_RE, default_pack_dir, num_decoder_layers
-from .quants import INT4_LAYOUTS, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize, int4_nbytes, release_staged
+from .quants import (INT4_LAYOUTS, PACK_LAYOUTS, Int4Weight, QuantizedEmbedding, dequant_int8_g16, dequantize,
+                     int4_nbytes, release_staged)
 from .reader import read_gguf
 
 ENGINES = {"qwen3moe": MoEEngine, "qwen35moe": Qwen35MoEEngine}
@@ -482,8 +483,11 @@ def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict):
     return [(p + LAYER_NAMES[rest], None)]
 
 def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
-    """Reads and dequantizes every non-expert tensor. Returns {Hugging Face name: tensor}, all resident in RAM."""
+    """Reads and dequantizes every non-expert tensor. Returns {Hugging Face name: tensor}, all resident in RAM.
+    A quantized embedding table stays quantized (QuantizedEmbedding), unless it doubles as the output layer."""
     weights = {}
+    embed_name = prefix + GLOBAL_NAMES["token_embd.weight"]
+    separate_output = "output.weight" in tensors
     fds = {}
     try:
         for gguf_name, t in tensors.items():
@@ -496,6 +500,9 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
             if os.preadv(fds[t.path], [raw], t.offset) != t.nbytes:
                 raise IOError(f"short read for {gguf_name} in {t.path}")
             for name, rows in targets:
+                if name == embed_name and separate_output and QuantizedEmbedding.supports(t.type, t.shape):
+                    weights[name] = QuantizedEmbedding(raw, t.type, t.shape)
+                    continue
                 # Tensors that need the converter's changes undone go through float32; the rest (including the
                 # big embedding and output tables) dequantize straight to bf16
                 fix = arch == "qwen35moe" and (".linear_attn." in name or name.endswith(("norm.weight", "_gate.weight")))

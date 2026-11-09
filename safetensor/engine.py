@@ -672,7 +672,9 @@ class MoEEngine:
     def forward(self, token_ids: list) -> torch.Tensor:
         """Runs new tokens through the model, extending the caches. Returns logits for each token."""
         self.ops.decoding = len(token_ids) == 1
-        x = self.w(self.prefix + "embed_tokens.weight")[self.to_device(torch.tensor(token_ids))]
+        table, ids = self.w(self.prefix + "embed_tokens.weight"), torch.tensor(token_ids)
+        # A GGUF table kept quantized (gguf.quants.QuantizedEmbedding) looks rows up on the CPU
+        x = table[self.to_device(ids)] if isinstance(table, torch.Tensor) else self.to_device(table[ids])
         cos, sin = self.rope(len(token_ids))
         for layer in range(self.num_layers):
             p = f"{self.prefix}layers.{layer}"

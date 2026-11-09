@@ -145,6 +145,28 @@ def dequantize(raw, type_name: str, shape: tuple, dtype: torch.dtype = torch.bfl
         out[start:start + chunk] = DEQUANTIZERS[type_name](blocks[start:start + chunk])
     return out.reshape(shape)
 
+class QuantizedEmbedding:
+    """An embedding table kept as its ggml blocks in RAM, in place of a bf16 tensor. table[ids] (ids: a CPU tensor)
+    dequantizes only those rows, giving the same bf16 values dequantize() gives for the whole table, as a CPU tensor.
+    A Q4_K 248320 x 2048 table takes 0.27 GiB this way, against 0.95 GiB in bf16."""
+
+    def __init__(self, raw: bytearray, type_name: str, shape: tuple):
+        rows, cols = shape
+        elements, block_bytes = BLOCK_SIZES[type_name]
+        self.blocks = torch.frombuffer(raw, dtype=torch.uint8).view(rows, cols // elements * block_bytes)
+        self.type_name, self.shape = type_name, tuple(shape)
+
+    @staticmethod
+    def supports(type_name: str, shape: tuple) -> bool:
+        return type_name in DEQUANTIZERS and len(shape) == 2 and shape[1] % BLOCK_SIZES[type_name][0] == 0
+
+    def to(self, device):
+        return self  # the table stays in CPU memory; the engine copies the rows it looks up to its device
+
+    def __getitem__(self, ids: torch.Tensor) -> torch.Tensor:
+        rows = self.blocks[ids]
+        return dequantize(rows.reshape(-1), self.type_name, (rows.shape[0], self.shape[1]))
+
 # Expert layouts the pack stores in place of the ggml blocks, so reading an expert costs little or no CPU:
 # dequantizing ggml blocks with torch takes several times longer than reading them from the SSD.
 #   INT4_G32 (from Q4_K and Q6_K): torch's CPU int4 matmul format. It is never dequantized; Int4Weight multiplies
