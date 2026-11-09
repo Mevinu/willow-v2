@@ -49,6 +49,13 @@ def main():
     chat = commands.add_parser("chat", help="Chat with the model; it remembers the conversation (Qwen3.5/3.6)")
     chat.add_argument("model", help="Model folder or .gguf file (the one `main.py pack` was run on)")
     add_run_options(chat)
+
+    web = commands.add_parser("web", help="Chat in a web page on this computer; it remembers the conversation "
+                                          "(Qwen3.5/3.6)")
+    web.add_argument("model", help="Model folder or .gguf file (the one `main.py pack` was run on)")
+    add_run_options(web)
+    web.add_argument("--port", type=int, default=8000, help="Port for the page on 127.0.0.1 (default: 8000)")
+    web.add_argument("--no-browser", action="store_true", help="Don't open the page in a browser")
     args = parser.parse_args()
 
     if args.command == "pack":
@@ -69,7 +76,11 @@ def main():
                               sync_timings=args.sync_timings, min_expert_weight=args.min_expert_weight)
     else:
         from safetensor.engine import load_engine
-    if args.command == "chat":
+    if args.command == "web":
+        from web.server import run_web
+        run_web(args.model, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb, load_engine,
+                args.port, not args.no_browser)
+    elif args.command == "chat":
         run_chat(args.model, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb, load_engine)
     else:
         run_prompt(args.model, args.prompt, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb,

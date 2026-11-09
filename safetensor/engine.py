@@ -719,10 +719,12 @@ class MoEEngine:
         self.reset()
         return self.continue_with(self.prompt_ids(prompt), max_new_tokens, stream)
 
-    def continue_with(self, ids: list, max_new_tokens: int = 100, stream: bool = False) -> list:
+    def continue_with(self, ids: list, max_new_tokens: int = 100, stream: bool = False, on_text=None) -> list:
         """Runs ids through the model after everything it has already seen (the caches are kept, so a chat only
         processes each new message), then decodes greedily. Returns ids + generated token ids; timings land in
-        self.stats. Stopping on an end token doesn't run that token through the model."""
+        self.stats. Stopping on an end token doesn't run that token through the model.
+        on_text, if given, is called with each new piece of the reply's text; it returns True to stop the reply
+        there, after that piece's token has run through the model, so the caches stay whole and a chat can go on."""
         self.stats = {}
         ids = list(ids)
         num_prompt = len(ids)
@@ -741,13 +743,19 @@ class MoEEngine:
             if next_id in self.eos_ids:
                 break
             ids.append(next_id)
-            if stream:
-                # Decode the whole reply so multi-byte characters split across tokens print correctly
+            stop = False
+            if stream or on_text:
+                # Decode the whole reply so multi-byte characters split across tokens come out correctly
                 text = self.tokenizer.decode(ids[num_prompt:])
-                print(text[len(printed):], end="", flush=True)
-                printed = text
+                piece, printed = text[len(printed):], text
+                if stream:
+                    print(piece, end="", flush=True)
+                if on_text:
+                    stop = bool(on_text(piece))
             logits = self.forward([next_id])
             decode_steps += 1
+            if stop:
+                break
         self.record_phase("decode", decode_steps, start)
         if stream:
             print()
