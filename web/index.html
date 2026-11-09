@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>willow</title>
+<style>
+  :root {
+    --bg: #fbfbfa; --text: #1f1f1d; --muted: #8a8a84; --faint: #ececea; --surface: #f3f3f1;
+    --box: #ffffff; --box-line: #e4e4e0; --accent: #1f1f1d; --accent-text: #ffffff; --danger: #b3261e;
+    --shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 4px 16px rgba(0, 0, 0, .05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #171716; --text: #e9e9e6; --muted: #8d8d87; --faint: #2a2a28; --surface: #232321;
+      --box: #1f1f1e; --box-line: #33332f; --accent: #e9e9e6; --accent-text: #171716; --danger: #f2827a;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 16px rgba(0, 0, 0, .25);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text); display: flex; flex-direction: column;
+    font: 15.5px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+  button:disabled { opacity: .4; cursor: default; }
+
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 12px 20px;
+    max-width: 760px; width: 100%; margin: 0 auto;
+  }
+  header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
+  #model { color: var(--muted); font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #reset { color: var(--muted); font-size: 13px; padding: 4px 8px; border-radius: 6px; }
+  #reset:hover:not(:disabled) { color: var(--text); background: var(--surface); }
+
+  main { flex: 1; overflow-y: auto; }
+  #messages { max-width: 760px; margin: 0 auto; padding: 8px 20px 24px; display: flex; flex-direction: column; gap: 22px; }
+  .empty { color: var(--muted); text-align: center; margin-top: 26vh; font-size: 17px; }
+  .user {
+    align-self: flex-end; max-width: 80%; background: var(--surface); padding: 9px 15px;
+    border-radius: 18px; white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .meta { color: var(--muted); font-size: 12px; margin-top: -14px; }
+  .meta.error { color: var(--danger); }
+
+  /* Rendered replies */
+  .reply { overflow-wrap: anywhere; }
+  .reply > :first-child { margin-top: 0; }
+  .reply > :last-child { margin-bottom: 0; }
+  .reply p, .reply ul, .reply ol, .reply pre, .reply blockquote, .reply table { margin: 0 0 .85em; }
+  .reply h1, .reply h2, .reply h3, .reply h4, .reply h5, .reply h6 { line-height: 1.3; margin: 1.3em 0 .5em; letter-spacing: -.01em; }
+  .reply h1 { font-size: 1.4em; } .reply h2 { font-size: 1.22em; } .reply h3 { font-size: 1.08em; }
+  .reply h4, .reply h5, .reply h6 { font-size: 1em; }
+  .reply ul, .reply ol { padding-left: 1.5em; }
+  .reply li { margin: .25em 0; }
+  .reply li > p { margin: 0 0 .4em; }
+  .reply li > ul, .reply li > ol, .reply li > pre { margin: .3em 0; }
+  .reply a { color: inherit; text-decoration: underline; text-decoration-color: var(--muted); text-underline-offset: 2px; }
+  .reply code {
+    font: .88em/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--surface); padding: .12em .35em; border-radius: 5px;
+  }
+  .reply pre { background: var(--surface); border-radius: 10px; padding: 12px 14px; overflow-x: auto; }
+  .reply pre code { background: none; padding: 0; font-size: 13px; white-space: pre; }
+  .reply blockquote { border-left: 3px solid var(--faint); margin-left: 0; padding-left: 14px; color: var(--muted); }
+  .reply hr { border: 0; border-top: 1px solid var(--faint); margin: 1.4em 0; }
+  .reply table { border-collapse: collapse; font-size: .94em; display: block; overflow-x: auto; }
+  .reply th, .reply td { border-bottom: 1px solid var(--faint); padding: 6px 14px 6px 0; text-align: left; vertical-align: top; }
+  .reply th { font-weight: 600; }
+  .reply details { color: var(--muted); margin: 0 0 .85em; font-size: .94em; }
+  .reply summary { cursor: pointer; user-select: none; list-style: none; }
+  .reply summary::-webkit-details-marker { display: none; }
+  .reply summary::after { content: " ›"; }
+  .reply details[open] summary::after { content: " ⌄"; }
+  .reply details > div { border-left: 3px solid var(--faint); padding-left: 14px; margin-top: .4em; }
+
+  /* While a reply is written: a shimmering label until text arrives, then each new piece fades in */
+  .shimmer {
+    display: inline-block; font-weight: 500;
+    background: linear-gradient(90deg, var(--muted) 30%, var(--text) 50%, var(--muted) 70%);
+    background-size: 250% 100%; -webkit-background-clip: text; background-clip: text; color: transparent;
+    animation: shimmer 1.8s linear infinite;
+  }
+  @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -150% 0; } }
+  .fade { animation: fade-in 600ms ease-out both; }
+  @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+  @media (prefers-reduced-motion: reduce) { .fade, .shimmer { animation: none; } .shimmer { color: var(--muted); } }
+
+  footer { padding: 0 20px 18px; }
+  form {
+    max-width: 720px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px;
+    background: var(--box); border: 1px solid var(--box-line); border-radius: 22px;
+    padding: 7px 7px 7px 16px; box-shadow: var(--shadow);
+  }
+  form:focus-within { border-color: var(--muted); }
+  textarea {
+    flex: 1; resize: none; border: 0; outline: 0; background: none; color: var(--text);
+    font: inherit; padding: 6px 0; max-height: 40vh;
+  }
+  textarea::placeholder { color: var(--muted); }
+  #send {
+    width: 34px; height: 34px; flex: none; border-radius: 50%; display: grid; place-items: center;
+    background: var(--accent); color: var(--accent-text);
+  }
+  #send svg { width: 16px; height: 16px; }
+</style>
+<script src="/vendor/marked.umd.js"></script>
+</head>
+<body>
+<header>
+  <h1>willow</h1>
+  <span id="model"></span>
+  <button id="reset" type="button">New chat</button>
+</header>
+<main id="scroll"><div id="messages"></div></main>
+<footer>
+  <form id="form">
+    <textarea id="input" rows="1" placeholder="Message" autofocus></textarea>
+    <button id="send" type="submit" aria-label="Send"></button>
+  </form>
+</footer>
+<script>
+// Markdown with marked (web/vendor). The model's text is never trusted as HTML: raw HTML in it is shown as text,
+// only http(s) links become links, and images show their description instead of loading anything.
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+const md = new marked.Marked({ gfm: true, breaks: true });
+md.use({
+  renderer: {
+    html({ text }) { return esc(text); },
+    link({ href, title, tokens }) {
+      const label = this.parser.parseInline(tokens);
+      if (!/^https?:\/\//i.test(href)) return label;
+      return `<a href="${esc(href)}"${title ? ` title="${esc(title)}"` : ""} target="_blank" rel="noopener noreferrer">${label}</a>`;
+    },
+    image({ text }) { return esc(text || ""); },
+  },
+});
+const markdown = (text) => md.parse(text);
+
+// A reply, with its <think>...</think> part (from --think) folded away
+function renderReply(text, writing) {
+  const start = text.indexOf("<think>");
+  if (start === -1) return markdown(text);
+  const end = text.indexOf("</think>", start);
+  const thought = text.slice(start + 7, end === -1 ? undefined : end).trim();
+  const rest = end === -1 ? "" : text.slice(end + 8);
+  const label = end === -1 ? `<span class="${writing ? "shimmer" : ""}">Thinking</span>` : "Thought";
+  return `<details><summary>${label}</summary><div>${markdown(thought)}</div></details>` + markdown(text.slice(0, start) + rest);
+}
+
+// Fading in new text. Each render rebuilds the reply's HTML, so the text that arrived in the last FADE_MS is wrapped
+// in spans whose animation is set back by how long ago it arrived: a piece keeps fading smoothly across re-renders.
+const FADE_MS = 600;
+
+function textNodes(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT), nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  return nodes;
+}
+
+function fadeNewText(el, stream) {
+  const nodes = textNodes(el), now = performance.now();
+  const total = nodes.reduce((n, node) => n + node.length, 0);
+  if (total < stream.shown) stream.marks = stream.marks.filter((m) => m.at < total);  // the layout changed shape
+  if (total > stream.shown) stream.marks.push({ at: stream.shown, time: now });
+  stream.shown = total;
+  const marks = stream.marks = stream.marks.filter((m) => now - m.time < FADE_MS);  // older pieces are fully shown
+  if (!marks.length) return;
+  let pos = 0;
+  for (const node of nodes) {
+    const start = pos, end = pos + node.length;
+    pos = end;
+    if (end <= marks[0].at || !node.length) continue;
+    const frag = document.createDocumentFragment();
+    let cut = start;
+    if (cut < marks[0].at) {
+      frag.append(node.data.slice(0, marks[0].at - start));
+      cut = marks[0].at;
+    }
+    for (let i = 0; i < marks.length && cut < end; i++) {
+      const until = Math.min(end, marks[i + 1] ? marks[i + 1].at : end);
+      if (until <= cut) continue;
+      const span = document.createElement("span");
+      span.className = "fade";
+      span.style.animationDelay = `${-(now - marks[i].time)}ms`;
+      span.textContent = node.data.slice(cut - start, until - start);
+      frag.append(span);
+      cut = until;
+    }
+    node.replaceWith(frag);
+  }
+}
+
+const $ = (id) => document.getElementById(id);
+const messages = $("messages"), input = $("input"), send = $("send"), reset = $("reset"), scroll = $("scroll");
+const ICONS = {
+  send: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>',
+  stop: '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>',
+};
+let busy = false;
+
+function setReply(el, text, stream) {
+  const open = el.querySelector("details")?.open;
+  el.innerHTML = renderReply(text, Boolean(stream));
+  if (open) el.querySelector("details")?.setAttribute("open", "");
+  if (stream) fadeNewText(el, stream);
+}
+
+const atBottom = () => scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 80;
+const toBottom = () => { scroll.scrollTop = scroll.scrollHeight; };
+
+function addTurn(role, text) {
+  messages.querySelector(".empty")?.remove();
+  const el = document.createElement("div");
+  if (role === "user") {
+    el.className = "user";
+    el.textContent = text;
+  } else {
+    el.className = "reply";
+    setReply(el, text);
+  }
+  messages.append(el);
+  return el;
+}
+
+function showEmpty() {
+  messages.innerHTML = '<div class="empty">What can I help with?</div>';
+}
+
+function setBusy(value) {
+  busy = value;
+  send.innerHTML = value ? ICONS.stop : ICONS.send;
+  send.setAttribute("aria-label", value ? "Stop" : "Send");
+  reset.disabled = value;
+}
+
+async function load() {
+  const state = await (await fetch("/api/state")).json();
+  $("model").textContent = state.model;
+  if (!state.history.length) return showEmpty();
+  messages.replaceChildren();
+  for (const turn of state.history) addTurn(turn.role, turn.text);
+  toBottom();
+}
+
+async function sendMessage(text) {
+  addTurn("user", text);
+  const reply = addTurn("assistant", "");
+  reply.innerHTML = '<span class="shimmer">Thinking</span>';
+  toBottom();
+  setBusy(true);
+  const stream = { shown: 0, marks: [] };
+  let written = "", frame = 0;
+  const draw = () => {  // at most once per frame, however fast tokens come
+    frame = 0;
+    const follow = atBottom();
+    setReply(reply, written, stream);
+    if (follow) toBottom();
+  };
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  try {
+    const res = await fetch("/api/chat", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || res.statusText);
+    const reader = res.body.getReader(), decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line) continue;
+        const item = JSON.parse(line);
+        if (item.text) {
+          written += item.text;
+          frame ||= requestAnimationFrame(draw);
+        }
+        if (item.error) { meta.classList.add("error"); meta.textContent = item.error; }
+        if (item.done) {
+          meta.textContent = `${item.tokens} tokens · ${item.tokens_per_second.toFixed(1)} tok/s` +
+            ` · ${item.context_tokens} in context` + (item.stopped ? " · stopped" : "");
+        }
+      }
+    }
+  } catch (err) {
+    meta.classList.add("error");
+    meta.textContent = `Couldn't reach the model: ${err.message}`;
+  }
+  if (frame) { cancelAnimationFrame(frame); draw(); }
+  if (!written) reply.innerHTML = "";
+  const follow = atBottom();
+  if (meta.textContent) reply.after(meta);
+  if (follow) toBottom();
+  setBusy(false);
+  input.focus();
+}
+
+$("form").addEventListener("submit", (e) => {
+  e.preventDefault();
+  if (busy) { fetch("/api/stop", { method: "POST" }); return; }
+  const text = input.value.trim();
+  if (!text) return;
+  input.value = "";
+  input.style.height = "";
+  sendMessage(text);
+});
+
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    if (!busy) $("form").requestSubmit();
+  }
+});
+
+input.addEventListener("input", () => {
+  input.style.height = "";
+  input.style.height = `${input.scrollHeight}px`;
+});
+
+reset.addEventListener("click", async () => {
+  if (busy) return;
+  reset.disabled = true;
+  await fetch("/api/reset", { method: "POST" });
+  showEmpty();
+  reset.disabled = false;
+  input.focus();
+});
+
+setBusy(false);
+load().catch(showEmpty);
+</script>
+</body>
+</html>

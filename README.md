@@ -91,6 +91,14 @@ Chat, keeping the conversation in context (Qwen3.5/3.6 models):
 
 The model loads once, then you type messages at the `>` prompt. It keeps the whole conversation in its caches, so each reply only has to read your new message, not the conversation again. `/reset` starts a new conversation, and `/exit` or Ctrl-D quits. Ctrl-C also quits, even mid-reply, since a reply cut off halfway leaves the caches half-updated. After each reply it prints that reply's speed and the conversation's length in tokens.
 
+Or chat in a web page, with the same memory of the conversation:
+
+```bash
+.venv/bin/python main.py web ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf --cache-gb 1
+```
+
+Once the model has loaded, it opens `http://127.0.0.1:8000` in your browser. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, and **New chat** starts over. Reloading the page brings back the conversation so far. The page is only reachable from this computer, and it handles one reply at a time. Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library, and its Markdown library is a copy in `web/vendor/`.
+
 Options for `pack`:
 
 | Option | Default | What it does |
@@ -129,6 +137,7 @@ The same commands take the Hugging Face model folder instead of a `.gguf` file. 
 - `main.py`: the command line. It picks the GGUF code for a `.gguf` file and the safetensors code for a folder.
 - `gguf/`: the GGUF file reader (`reader.py`), dequantization and the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`), the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`), the GGUF expert-pack compiler (`compiler.py`) and the GGUF loader (`engine.py`). The loader renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes, then runs them on the model code in `safetensor/engine.py`.
 - `safetensor/`: the model code shared by both formats (`engine.py`), the safetensors expert-pack compiler (`compiler.py`) and its checks.
+- `web/`: the chat page for `main.py web`: the page (`index.html`) and its server (`server.py`). Replies are rendered as Markdown with [marked](https://github.com/markedjs/marked) 16.4.2, kept in `web/vendor/` (MIT license, `marked-LICENSE.md`) so the page works offline.
 
 ## Checking correctness (optional)
 
