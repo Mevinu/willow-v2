@@ -5,7 +5,7 @@ def is_gguf(model: str) -> bool:
 
 def add_run_options(command):
     """The options `run` and `chat` share."""
-    command.add_argument("--max-new-tokens", type=int, default=2048,
+    command.add_argument("--max-new-tokens", type=int, default=100000,
                          help="upper limit (per reply, for chat); generation stops earlier when the model emits an "
                               "end token")
     command.add_argument("--pack-dir", default=None, help="Default: where `main.py pack` writes it")

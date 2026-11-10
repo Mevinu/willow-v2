@@ -89,7 +89,7 @@ Chat, keeping the conversation in context (Qwen3.5/3.6 models):
 .venv/bin/python main.py chat ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf --cache-gb 1
 ```
 
-The model loads once, then you type messages at the `>` prompt. It keeps the whole conversation in its caches, so each reply only has to read your new message, not the conversation again. `/reset` starts a new conversation, and `/exit` or Ctrl-D quits. Ctrl-C also quits, even mid-reply, since a reply cut off halfway leaves the caches half-updated. After each reply it prints that reply's speed and the conversation's length in tokens.
+The model loads once, then you type messages at the `>` prompt. It keeps the whole conversation in its caches, so each reply only has to read your new message, not the conversation again. `/think` turns thinking on or off, `/reset` starts a new conversation, and `/exit` or Ctrl-D quits. Ctrl-C also quits, even mid-reply, since a reply cut off halfway leaves the caches half-updated. After each reply it prints that reply's speed and the conversation's length in tokens.
 
 Or chat in a web page, with the same memory of the conversation:
 
@@ -111,7 +111,7 @@ Options for `run` and `chat` (`chat` takes no prompt, and `--max-new-tokens` app
 | Option | Default | What it does |
 |---|---|---|
 | `--max-new-tokens N` | 2048 | Upper limit on the reply length. Generation stops earlier once the model finishes its answer. |
-| `--think` | off | Lets the model think before answering. This adds a lot of tokens. |
+| `--think` | off | Lets the model think before answering. This adds a lot of tokens. The thinking is printed dimmed before the answer (in `web`, folded under "Thought"). In `chat`, `/think` turns it on or off for the next messages; in `web`, the Think button does. |
 | `--pack-dir DIR` | `<name>.expert_pack` (or `<model_dir>/expert_pack`) | Use a pack stored somewhere else. |
 | `--cache-gb N` | 0 | RAM for caching recently used experts. For a GPU pack, the cache is memory shared with the GPU, with at least 64 slots (about 120 MiB for this model) even at 0. For safetensors, leave it at 0 on a 16 GB machine: the OS file cache already does this, and an extra cache causes memory pressure that slows everything down. |
 | `--preload` / `--no-preload` | on | GGUF only: read each layer's most used 15% of experts (from the usage table) into the cache before generating. Needs `--cache-gb`. |

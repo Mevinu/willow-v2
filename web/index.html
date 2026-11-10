@@ -106,6 +106,13 @@
     background: var(--accent); color: var(--accent-text);
   }
   #send svg { width: 16px; height: 16px; }
+  #think {
+    height: 34px; flex: none; display: flex; align-items: center; gap: 5px; padding: 0 11px;
+    border-radius: 17px; font-size: 13px; color: var(--muted); border: 1px solid transparent;
+  }
+  #think svg { width: 14px; height: 14px; }
+  #think:hover { color: var(--text); background: var(--surface); }
+  #think[aria-pressed="true"] { color: var(--text); background: var(--surface); border-color: var(--box-line); }
 </style>
 <script src="/vendor/marked.umd.js"></script>
 </head>
@@ -119,6 +126,10 @@
 <footer>
   <form id="form">
     <textarea id="input" rows="1" placeholder="Message" autofocus></textarea>
+    <button id="think" type="button" aria-pressed="false" title="Think before answering (slower, often better)">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 13.5h4M6.5 11.5h3M8 2a4 4 0 0 0-2.4 7.2c.5.4.9 1 .9 1.6v.2h3v-.2c0-.6.4-1.2.9-1.6A4 4 0 0 0 8 2Z"/></svg>
+      Think
+    </button>
     <button id="send" type="submit" aria-label="Send"></button>
   </form>
 </footer>
@@ -140,7 +151,7 @@ md.use({
 });
 const markdown = (text) => md.parse(text);
 
-// A reply, with its <think>...</think> part (from --think) folded away
+// A reply, with its <think>...</think> part (thinking on) shown in gray above the answer; it can be folded away
 function renderReply(text, writing) {
   const start = text.indexOf("<think>");
   if (start === -1) return markdown(text);
@@ -148,7 +159,7 @@ function renderReply(text, writing) {
   const thought = text.slice(start + 7, end === -1 ? undefined : end).trim();
   const rest = end === -1 ? "" : text.slice(end + 8);
   const label = end === -1 ? `<span class="${writing ? "shimmer" : ""}">Thinking</span>` : "Thought";
-  return `<details><summary>${label}</summary><div>${markdown(thought)}</div></details>` + markdown(text.slice(0, start) + rest);
+  return `<details open><summary>${label}</summary><div>${markdown(thought)}</div></details>` + markdown(text.slice(0, start) + rest);
 }
 
 // Fading in new text. Each render rebuilds the reply's HTML, so the text that arrived in the last FADE_MS is wrapped
@@ -196,16 +207,22 @@ function fadeNewText(el, stream) {
 
 const $ = (id) => document.getElementById(id);
 const messages = $("messages"), input = $("input"), send = $("send"), reset = $("reset"), scroll = $("scroll");
+const thinkButton = $("think");
 const ICONS = {
   send: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>',
   stop: '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>',
 };
-let busy = false;
+let busy = false, think = false;
+
+function setThink(value) {
+  think = value;
+  thinkButton.setAttribute("aria-pressed", String(value));
+}
 
 function setReply(el, text, stream) {
-  const open = el.querySelector("details")?.open;
+  const folded = el.querySelector("details")?.open === false;  // keep the thought folded if it was folded
   el.innerHTML = renderReply(text, Boolean(stream));
-  if (open) el.querySelector("details")?.setAttribute("open", "");
+  if (folded) el.querySelector("details")?.removeAttribute("open");
   if (stream) fadeNewText(el, stream);
 }
 
@@ -240,6 +257,7 @@ function setBusy(value) {
 async function load() {
   const state = await (await fetch("/api/state")).json();
   $("model").textContent = state.model;
+  setThink(Boolean(state.think));
   if (!state.history.length) return showEmpty();
   messages.replaceChildren();
   for (const turn of state.history) addTurn(turn.role, turn.text);
@@ -249,7 +267,7 @@ async function load() {
 async function sendMessage(text) {
   addTurn("user", text);
   const reply = addTurn("assistant", "");
-  reply.innerHTML = '<span class="shimmer">Thinking</span>';
+  reply.innerHTML = `<span class="shimmer">${think ? "Thinking" : "Writing"}</span>`;
   toBottom();
   setBusy(true);
   const stream = { shown: 0, marks: [] };
@@ -264,7 +282,7 @@ async function sendMessage(text) {
   meta.className = "meta";
   try {
     const res = await fetch("/api/chat", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }),
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text, think }),
     });
     if (!res.ok) throw new Error((await res.json()).error || res.statusText);
     const reader = res.body.getReader(), decoder = new TextDecoder();
@@ -311,6 +329,8 @@ $("form").addEventListener("submit", (e) => {
   input.style.height = "";
   sendMessage(text);
 });
+
+thinkButton.addEventListener("click", () => { setThink(!think); input.focus(); });
 
 input.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {

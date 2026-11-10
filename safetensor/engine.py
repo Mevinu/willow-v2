@@ -1,4 +1,5 @@
 import os
+import sys
 import math
 import json
 import time
@@ -714,10 +715,10 @@ class MoEEngine:
             "timings": timings,
         }
 
-    def generate(self, prompt: str, max_new_tokens: int = 100, stream: bool = False) -> list:
+    def generate(self, prompt: str, max_new_tokens: int = 100, stream: bool = False, on_text=None) -> list:
         """Greedy decoding from a fresh start. Returns prompt + generated token ids; timings land in self.stats."""
         self.reset()
-        return self.continue_with(self.prompt_ids(prompt), max_new_tokens, stream)
+        return self.continue_with(self.prompt_ids(prompt), max_new_tokens, stream, on_text)
 
     def continue_with(self, ids: list, max_new_tokens: int = 100, stream: bool = False, on_text=None) -> list:
         """Runs ids through the model after everything it has already seen (the caches are kept, so a chat only
@@ -863,6 +864,37 @@ class Qwen35MoEEngine(MoEEngine):
         text += "<think>\n" if self.think else "<think>\n\n</think>\n\n"
         return self.tokenizer.encode(text, add_special_tokens=False).ids
 
+class ReplyPrinter:
+    """Prints a reply to the terminal as it streams (an on_text callback). With thinking on, the reply starts inside
+    the <think> block the prompt opened: that part is printed dimmed, and the </think> tag is left out."""
+
+    DIM, PLAIN = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
+
+    def __init__(self, thinking: bool):
+        self.thinking = thinking
+        self.answer_started = False
+        if thinking:
+            print(self.DIM, end="")
+
+    def __call__(self, piece: str) -> bool:
+        if self.thinking:
+            thought, tag, piece = piece.partition("</think>")  # </think> is one token, so it arrives whole
+            print(thought, end="", flush=True)
+            if not tag:
+                return False
+            self.thinking = False
+            print(self.PLAIN + "\n", end="")
+        if not self.answer_started:  # the model puts blank lines after </think>
+            piece = piece.lstrip("\n")
+            self.answer_started = bool(piece)
+        print(piece, end="", flush=True)
+        return False
+
+    def finish(self):
+        """Ends the reply's line, and the dimming if it stopped mid-thought."""
+        print(self.PLAIN if self.thinking else "")
+        self.thinking = False
+
 ENGINES = {"qwen3_moe": MoEEngine, "qwen3_5_moe": Qwen35MoEEngine}
 
 def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = None) -> MoEEngine:
@@ -908,7 +940,10 @@ def run_chat(model_dir: str, max_new_tokens: int = 2048, pack_dir: str = None, t
     if not isinstance(engine, Qwen35MoEEngine):
         raise SystemExit("chat needs a Qwen3.5/3.6 model (it uses their chat format)")
     engine.think = think
-    print("\nchat: type a message and press Enter. /reset starts over, /exit (or Ctrl-D) quits.")
+    print("\nchat: type a message and press Enter. /think turns thinking on or off, /reset starts over, "
+          "/exit (or Ctrl-D) quits.")
+    print(f"(thinking {'on' if think else 'off'})")
+    printer = None
     try:
         while True:
             try:
@@ -921,15 +956,23 @@ def run_chat(model_dir: str, max_new_tokens: int = 2048, pack_dir: str = None, t
                 engine.reset()
                 print("(new conversation)")
                 continue
+            if message == "/think":
+                engine.think = not engine.think
+                print(f"(thinking {'on' if engine.think else 'off'})")
+                continue
             if not message:
                 continue
             print()
-            engine.continue_with(engine.prompt_ids(message), max_new_tokens, stream=True)
+            printer = ReplyPrinter(engine.think)
+            engine.continue_with(engine.prompt_ids(message), max_new_tokens, on_text=printer)
+            printer.finish()
             read, reply = engine.stats["prefill"], engine.stats["decode"]
             speed = f" at {reply['tokens'] / reply['seconds']:.1f} tok/s" if reply["tokens"] else ""
             print(f"\n[{reply['tokens']} tokens{speed}; read your message in {read['seconds']:.1f}s; "
                   f"conversation so far: {engine.position} tokens]")
     except KeyboardInterrupt:  # mid-reply, this leaves the caches half-updated, so it quits rather than continues
+        if printer:
+            printer.finish()
         print()
     finally:
         engine.experts.save_usage()
@@ -946,7 +989,11 @@ def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir
         print(f"> {prompt}\n")
     else:
         print(prompt, end="", flush=True)
-    engine.generate(prompt, max_new_tokens, stream=True)
+    printer = ReplyPrinter(think and isinstance(engine, Qwen35MoEEngine))
+    try:
+        engine.generate(prompt, max_new_tokens, on_text=printer)
+    finally:
+        printer.finish()
     engine.experts.save_usage()
 
     print(f"\n--- stats ---\nload:     {load_seconds:.1f}s")

@@ -19,16 +19,18 @@ FILES = {"/": ("index.html", "text/html; charset=utf-8"),
 class Job:
     """One request for the model thread: a chat message, or a reset."""
 
-    def __init__(self, kind: str, message: str = None):
+    def __init__(self, kind: str, message: str = None, think: bool = None):
         self.kind, self.message = kind, message
+        self.think = think  # think before answering; None keeps the engine's setting
         self.out = queue.Queue()  # dicts for the page, then None when the job is done
         self.stop = threading.Event()
 
 class Chat:
     """What the web threads and the model thread share."""
 
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, think: bool):
         self.model_name = model_name
+        self.think = think   # thinking for the next message (the last one's setting, so a reloaded page keeps it)
         self.jobs = queue.Queue()
         self.lock = threading.Lock()
         self.history = []    # [{"role": "user" | "assistant", "text": str}]
@@ -36,15 +38,22 @@ class Chat:
 
     def snapshot(self) -> dict:
         with self.lock:
-            return {"model": self.model_name, "busy": self.current is not None,
+            return {"model": self.model_name, "busy": self.current is not None, "think": self.think,
                     "history": [dict(turn) for turn in self.history]}
 
 def reply(engine, chat: Chat, job: Job, max_new_tokens: int):
-    """Runs one chat message on the model thread, streaming the reply's text into job.out."""
+    """Runs one chat message on the model thread, streaming the reply's text into job.out. With thinking on, the
+    prompt ends with <think>, so the reply starts mid-thought: its text gets the tag back, for the page to fold."""
+    if job.think is not None:
+        engine.think = job.think
+    ids = engine.prompt_ids(job.message)
     with chat.lock:
+        chat.think = engine.think
         chat.history.append({"role": "user", "text": job.message})
-        turn = {"role": "assistant", "text": ""}
+        turn = {"role": "assistant", "text": "<think>" if engine.think else ""}
         chat.history.append(turn)
+    if turn["text"]:
+        job.out.put({"text": turn["text"]})
 
     def on_text(piece: str) -> bool:
         with chat.lock:
@@ -53,7 +62,7 @@ def reply(engine, chat: Chat, job: Job, max_new_tokens: int):
         return job.stop.is_set()
 
     try:
-        engine.continue_with(engine.prompt_ids(job.message), max_new_tokens, on_text=on_text)
+        engine.continue_with(ids, max_new_tokens, on_text=on_text)
     except Exception as e:
         # A failure partway through a forward pass leaves the caches half updated, so the conversation starts over
         traceback.print_exc()
@@ -104,10 +113,12 @@ def make_handler(chat: Chat):
 
         def do_POST(self):
             if self.path == "/api/chat":
-                message = str(self.read_json().get("message", "")).strip()
+                body = self.read_json()
+                message = str(body.get("message", "")).strip()
                 if not message:
                     return self.send_json(400, {"error": "empty message"})
-                job = Job("chat", message)
+                think = body.get("think")
+                job = Job("chat", message, None if think is None else bool(think))
                 chat.jobs.put(job)
                 # The reply streams as one JSON object per line
                 self.send_response(200)
@@ -145,7 +156,7 @@ def run_web(model: str, max_new_tokens: int, pack_dir: str, think: bool, cache_g
     if not isinstance(engine, Qwen35MoEEngine):
         raise SystemExit("web needs a Qwen3.5/3.6 model (it uses their chat format)")
     engine.think = think
-    chat = Chat(os.path.basename(model))
+    chat = Chat(os.path.basename(model), think)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(chat))
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
