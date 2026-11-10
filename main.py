@@ -13,7 +13,7 @@ def add_run_options(command):
     command.add_argument("--cache-gb", type=float, default=0,
                          help="GiB of RAM for caching recently used experts (default: 0, off; the OS file cache "
                               "still keeps recently read experts in spare RAM). Needed for --preload")
-    command.add_argument("--preload", action=argparse.BooleanOptionalAction, default=False,
+    command.add_argument("--preload", action=argparse.BooleanOptionalAction, default=True,
                          help="For .gguf: read each layer's most used 15%% of experts (from earlier runs) into the "
                               "cache before generating (needs --cache-gb)")
     command.add_argument("--gpu-backbone", action=argparse.BooleanOptionalAction, default=True,
