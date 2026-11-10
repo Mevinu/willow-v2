@@ -1,147 +1,165 @@
 # willow
 
-Run a large Mixture-of-Experts (MoE) language model on a laptop that doesn't have enough RAM to hold it, by streaming the model's experts from the SSD.
+Run **Qwen3.6-35B-A3B** as a Q4_K_M GGUF on a 16 GB laptop, by keeping the model's experts on the SSD and streaming in only the ones each token needs.
 
-> **Heads up:** this is a vibe-coded proof of concept. I've only tested it on a Mac (M5 MacBook Pro, 16 GB RAM), so I don't know how well it works on Linux or Windows.
+> **Heads up:** this is a vibe-coded proof of concept. It's only been tested on a Mac (M5 MacBook Pro, 16 GB RAM), with one GGUF file. I don't know how well it works on Linux or Windows.
 
-## Target model
+## The model under test
 
-It's built and tuned for **[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)**: 35B parameters in total, about 3B used per token. The main format is a quantized **GGUF** file made by llama.cpp: the experts stay quantized on disk, so each token reads far less than with the original bf16 weights. The vision encoder and multi-token-prediction head aren't used; this is text only.
+Everything here is built, tuned and tested against one file:
 
-The model I test on is **[Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf](https://huggingface.co/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive)**, a Q4_K_M GGUF of a Qwen3.6-35B-A3B fine-tune. Q4_K_M mixes Q4_K and Q6_K, the two types with a fast path (see below). Any GGUF of the same architecture should work the same way.
+**[`Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`](https://huggingface.co/HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive)**
 
-Supported:
+- A fine-tune of [Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B): a Mixture-of-Experts model with 35B parameters in total and about 3B used per token.
+- GGUF architecture `qwen35moe`, made by llama.cpp.
+- **Q4_K_M** quantization, which mixes **Q4_K** and **Q6_K** tensors. Those are exactly the two types willow has fast paths for (see [How the GGUF is run](#how-the-gguf-is-run)).
+- Text only: the vision encoder and multi-token-prediction head aren't used.
 
-- **GGUF** (main path): a single `.gguf` file (or a split one), for the `qwen35moe` and `qwen3moe` architectures. Quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (IQ quants aren't supported yet). Only Q4_K_M has been tested; other types should load, but go through a slower dequantization path.
-- **safetensors**: the Hugging Face model folder, as downloaded, in bf16. This was the original path; it still works but is much slower, since each token reads about 1.9 GiB of bf16 experts (about 3 tokens/s decoding and 6 tokens/s on prompts on the 16 GB M5).
+Other GGUFs of the same architecture should work the same way, but this is the only one that has actually been run. See [Other models and formats](#other-models-and-formats).
 
-The engine also supports the older Qwen3-MoE models (`model_type: qwen3_moe`).
+## Quick start
 
-## How it works
-
-The model won't fit in 16 GB of RAM. Most of its size is in the **experts**: 40 layers × 256 experts. For each token, a small router in each layer picks just 8 of its 256 experts, so only a small slice of them is needed at any moment.
-
-1. **Pack:** `main.py pack` copies every expert's weights out of the GGUF (or safetensors) files into one file, `experts.pack`. In it, each expert sits in a single 16 KB-aligned block (Apple Silicon's page size), so it can be loaded with one read. `manifest.json` records where each expert is.
-2. **Run:** `main.py run` keeps everything except the experts in RAM: attention, the router, the shared expert, the embeddings and the output layer. That's about 7 GB. At each layer, once the router has picked its 8 experts, all 8 are read from `experts.pack` at the same time on a pool of threads. Cached experts are computed first, while the misses are read, and each miss is computed as soon as its read finishes. While decoding, each layer also runs the next layer's router on its hidden state and starts reading that layer's 4 most likely experts early. macOS's file cache keeps recently read experts in spare RAM automatically.
-
-At the end of each run, it prints stats: tokens/s, GiB read per token, disk speed, and where the time went. Most of the time is still spent reading experts from the SSD.
-
-### GGUF experts
-
-The non-expert weights are dequantized to bf16 when the model loads (on Apple Silicon, bf16 matrix multiplies are faster for them than PyTorch's 4-bit kernel). The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so `pack` stores the two most common types in layouts that are cheap to run:
-
-- **Q4_K** is stored in PyTorch's own 4-bit format. Each matrix multiply runs straight on the 4-bit weights, so these experts are never dequantized.
-- **Q6_K** is requantized to the same 4-bit format when packing. It loses some of Q6_K's precision, but every expert then runs on the 4-bit kernel and is read straight into its cache slot. Packs built earlier store Q6_K as int8; they still run, but print a note asking you to rebuild.
-- Other types are copied byte for byte and dequantized as each expert is read, which is slower.
-
-Each expert's gate and up matrices are also fused into one, so computing an expert takes two matrix multiplies instead of three.
-
-The 4-bit formats come from private PyTorch functions, so a pack records the PyTorch version it was built with. If you upgrade PyTorch, rerun `main.py pack`. An older pack still runs, but prints a note asking you to rebuild it.
-
-### On the GPU
-
-By default (when PyTorch can use Apple's GPU through MPS), `pack` stores the 4-bit experts in the layout of PyTorch's GPU 4-bit kernel, and `run` computes the experts on the GPU. The expert cache is then memory the CPU and GPU share (Apple Silicon has one pool of RAM for both), so each expert is read from the SSD straight into memory the GPU computes from, with no extra copy. Even with `--cache-gb 0`, there are 64 such slots (about 120 MiB for this model) to read into.
-
-The rest of the model (attention, the routers, the shared experts and the output layer) runs on the GPU too, so the hidden state stays there. The non-expert weights are moved to GPU memory when the model loads (their CPU copies are freed, so it's no extra RAM). On the GPU, every small operation costs about the same to issue however little work it does, and each layer has about a hundred of them. So while decoding, the small steps are compiled with `torch.compile`, which fuses them into a few GPU kernels. That compile takes about a second on the first generated token, less on later runs (PyTorch caches it on disk). The KV cache grows in blocks of 256 positions, because each new tensor shape costs a fresh GPU setup (about 11 ms per attention layer if it grew by one position per token). Each layer waits for the GPU once: to bring back which experts its tokens picked (and the guesses for the next layer), which it needs on the CPU to read them. `--no-gpu-backbone` keeps all of this on the CPU, with only the experts on the GPU.
-
-PyTorch has no Python API for shared GPU memory, so a small Objective-C++ helper (`gguf/mps_shared.mm`) is compiled with `clang++` the first time a GPU pack runs, into `gguf/build/`. This needs Xcode or its Command Line Tools (`xcode-select --install`). A pack's layout decides where its experts run, so to switch, rerun `pack` with `--gpu` or `--no-gpu`.
-
-### Expert cache, usage table and preload
-
-By default no experts are cached in RAM beyond the OS file cache; `--cache-gb N` sets aside N GiB for a cache of recently used ones.
-
-Each run also keeps a **usage table**: how many tokens each expert in each layer has been routed to, counting both prompt and generated tokens. It's saved to `expert_usage.json` in the pack folder after every run, and each run adds to the counts from the ones before, so over time it records which experts the model uses most. When the model loads, each layer's most used 15% of experts are read into the cache before generating, so they start as cache hits. Experts that have never been used are skipped, and the preload never goes past the cache size. The first run on a pack has no table yet, so it preloads nothing. Preloading needs the cache, so it only happens with `--cache-gb` set; turn it off with `--no-preload`.
-
-## Setup
-
-You need Python 3.9 or newer, and free disk space for the model plus its expert pack (about the same size again; the pack holds the experts, which are most of the model).
+You need Python 3.9 or newer, and free disk space for the GGUF plus its expert pack (about the same size again, since the experts are most of the model). On a Mac, also install Xcode's Command Line Tools if you haven't (`xcode-select --install`); the GPU path compiles a small helper with `clang++`.
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-Put your `.gguf` file somewhere, for example `~/Models/`. On a Mac with the GPU path, also install Xcode's Command Line Tools if you haven't (`xcode-select --install`).
+Download the GGUF, for example into `~/Models/`:
 
-## Usage
+```bash
+.venv/bin/pip install -U huggingface_hub
+.venv/bin/hf download HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive \
+  Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf --local-dir ~/Models
+```
 
-Build the expert pack. You only need to do this once per model (and again after upgrading PyTorch). Pass the `.gguf` file (for a split model, any one of its files); the pack goes next to it, in `<name>.expert_pack/`:
+Build the expert pack. You only do this once (and again after upgrading PyTorch). It's written next to the GGUF, in `<name>.expert_pack/`:
 
 ```bash
 .venv/bin/python main.py pack ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf
 ```
 
-Generate text:
-
-```bash
-.venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf "Write a short poem about a lazy cat."
-```
-
-With a 4 GiB expert cache, preloaded from the usage table of earlier runs:
-
-```bash
-.venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf "Write a short poem about a lazy cat." --cache-gb 4
-```
-
-Chat, keeping the conversation in context (Qwen3.5/3.6 models):
+Then chat with it:
 
 ```bash
 .venv/bin/python main.py chat ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf --cache-gb 1
 ```
 
-The model loads once, then you type messages at the `>` prompt. It keeps the whole conversation in its caches, so each reply only has to read your new message, not the conversation again. `/think` turns thinking on or off, `/reset` starts a new conversation, and `/exit` or Ctrl-D quits. Ctrl-C also quits, even mid-reply, since a reply cut off halfway leaves the caches half-updated. After each reply it prints that reply's speed and the conversation's length in tokens.
+## Commands
 
-Or chat in a web page, with the same memory of the conversation:
+All of these take the `.gguf` file the pack was built from. For brevity, `MODEL` below stands for `~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`.
+
+**One prompt, one reply:**
 
 ```bash
-.venv/bin/python main.py web ~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf --cache-gb 1
+.venv/bin/python main.py run MODEL "Write a short poem about a lazy cat."
+.venv/bin/python main.py run MODEL "Write a short poem about a lazy cat." --cache-gb 4   # with a 4 GiB expert cache
 ```
 
-Once the model has loaded, it opens `http://127.0.0.1:8000` in your browser. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, and **New chat** starts over. Reloading the page brings back the conversation so far. The page is only reachable from this computer, and it handles one reply at a time. Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library, and its Markdown library is a copy in `web/vendor/`.
+At the end it prints stats: tokens/s, GiB read per token, disk speed, and where the time went.
 
-Options for `pack`:
+**Chat in the terminal:**
 
-| Option | Default | What it does |
-|---|---|---|
-| `--out-dir DIR` | `<name>.expert_pack` (or `<model_dir>/expert_pack`) | Where to write the pack. |
-| `--gpu` / `--no-gpu` | on when PyTorch can use MPS | GGUF only: store the 4-bit experts so they run on the GPU. `--no-gpu` keeps them on the CPU. |
+```bash
+.venv/bin/python main.py chat MODEL --cache-gb 1
+```
 
-Options for `run` and `chat` (`chat` takes no prompt, and `--max-new-tokens` applies to each reply):
+The model loads once, then you type messages at the `>` prompt. The whole conversation stays in the model's caches, so each reply only has to read your new message, not the conversation again. `/think` turns thinking on or off, `/reset` starts a new conversation, and `/exit` or Ctrl-D quits. Ctrl-C also quits, even mid-reply, since a reply cut off halfway leaves the caches half-updated. After each reply it prints that reply's speed and the conversation's length in tokens.
 
-| Option | Default | What it does |
-|---|---|---|
-| `--max-new-tokens N` | 2048 | Upper limit on the reply length. Generation stops earlier once the model finishes its answer. |
-| `--think` | off | Lets the model think before answering. This adds a lot of tokens. The thinking is printed dimmed before the answer (in `web`, folded under "Thought"). In `chat`, `/think` turns it on or off for the next messages; in `web`, the Think button does. |
-| `--pack-dir DIR` | `<name>.expert_pack` (or `<model_dir>/expert_pack`) | Use a pack stored somewhere else. |
-| `--cache-gb N` | 0 | RAM for caching recently used experts. For a GPU pack, the cache is memory shared with the GPU, with at least 64 slots (about 120 MiB for this model) even at 0. For safetensors, leave it at 0 on a 16 GB machine: the OS file cache already does this, and an extra cache causes memory pressure that slows everything down. |
-| `--preload` / `--no-preload` | on | GGUF only: read each layer's most used 15% of experts (from the usage table) into the cache before generating. Needs `--cache-gb`. |
-| `--gpu-backbone` / `--no-gpu-backbone` | on | GGUF with a GPU pack only: also run attention, the routers, the shared experts and the output layer on the GPU. `--no-gpu-backbone` keeps them on the CPU. |
-| `--min-expert-weight W` | 0 (off) | GGUF only: skip routed experts below routing weight `W`, e.g. `0.02`, keeping each token's top expert and scaling the other weights back up. Faster, but it changes the output and can lower its quality. The stats show how many were skipped. |
-| `--sync-timings` | off | Wait for the GPU at every section boundary, so `decode time per token, by section` shows where GPU time goes. Slower. Without it, GPU work runs in the background and is counted in whichever section next waits for it (mostly `gpu wait`, where each layer waits to get its expert choices back). |
+**Chat in a web page:**
+
+```bash
+.venv/bin/python main.py web MODEL --cache-gb 1
+```
+
+Once the model has loaded, it opens `http://127.0.0.1:8000`. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, **New chat** starts over, and the **Think** button toggles thinking. Reloading the page brings back the conversation so far. The page is only reachable from this computer and handles one reply at a time; Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library.
 
 Decoding is greedy: it always picks the most likely next token.
 
-### Running the bf16 safetensors model
+### Options for `run`, `chat` and `web`
 
-The same commands take the Hugging Face model folder instead of a `.gguf` file. It needs about 130 GB of free disk space: 67 GB for the model and 60 GB for the pack, which goes in `<model_dir>/expert_pack/`.
+(`chat` and `web` take no prompt; `--max-new-tokens` applies to each reply.)
 
-```bash
-.venv/bin/pip install -U huggingface_hub
-.venv/bin/hf download Qwen/Qwen3.6-35B-A3B --local-dir ~/Models/Qwen3.6-35B-A3B
-.venv/bin/python main.py pack ~/Models/Qwen3.6-35B-A3B
-.venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B "Write a short poem about a lazy cat."
-```
+| Option | Default | What it does |
+|---|---|---|
+| `--cache-gb N` | 0 | RAM for caching recently used experts. The cache is memory shared with the GPU, with at least 64 slots (about 120 MiB) even at 0. |
+| `--preload` / `--no-preload` | on | Read each layer's most used 15% of experts (from the usage table) into the cache before generating. Needs `--cache-gb`. |
+| `--think` | off | Let the model think before answering. This adds a lot of tokens. The thinking is printed dimmed before the answer (in `web`, folded under "Thought"). |
+| `--max-new-tokens N` | 100000 | Upper limit on the reply length. Generation stops earlier once the model finishes its answer. |
+| `--min-expert-weight W` | 0 (off) | Skip routed experts below routing weight `W`, e.g. `0.02`, keeping each token's top expert and scaling the other weights back up. Faster, but it changes the output and can lower its quality. The stats show how many were skipped. |
+| `--gpu-backbone` / `--no-gpu-backbone` | on | With a GPU pack, also run attention, the routers, the shared experts and the output layer on the GPU. `--no-gpu-backbone` keeps them on the CPU. |
+| `--pack-dir DIR` | `<name>.expert_pack` | Use a pack stored somewhere else. |
+| `--sync-timings` | off | Wait for the GPU at every section boundary, so `decode time per token, by section` shows where GPU time goes. Slower. Without it, GPU work runs in the background and is counted in whichever section next waits for it (mostly `gpu wait`). |
+
+### Options for `pack`
+
+| Option | Default | What it does |
+|---|---|---|
+| `--out-dir DIR` | `<name>.expert_pack` | Where to write the pack. |
+| `--gpu` / `--no-gpu` | on when PyTorch can use MPS | Store the 4-bit experts so they run on the GPU. `--no-gpu` keeps them on the CPU. |
+
+## How it works
+
+The model won't fit in 16 GB of RAM. Most of its size is in the **experts**: 40 layers × 256 experts. For each token, a small router in each layer picks just 8 of its 256 experts, so only a small slice of them is needed at any moment.
+
+1. **Pack:** `main.py pack` copies every expert's weights out of the GGUF into one file, `experts.pack`. Each expert sits in a single 16 KB-aligned block (Apple Silicon's page size), so it can be loaded with one read. `manifest.json` records where each expert is.
+2. **Run:** everything except the experts stays in RAM: attention, the routers, the shared experts, the embeddings and the output layer, about 7 GB. At each layer, once the router has picked its 8 experts, all 8 are read from `experts.pack` at once on a pool of threads. Cached experts are computed first while the misses are read, and each miss is computed as soon as its read finishes. While decoding, each layer also runs the next layer's router on its hidden state and starts reading that layer's 4 most likely experts early. macOS's file cache keeps recently read experts in spare RAM too.
+
+Most of the time is still spent reading experts from the SSD.
+
+### How the GGUF is run
+
+The embedding table stays quantized, and rows are dequantized as they're looked up. The other non-expert weights are dequantized to bf16 when the model loads (on Apple Silicon, bf16 matrix multiplies are faster for them than PyTorch's 4-bit kernel).
+
+The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so `pack` stores Q4_K_M's two types in layouts that are cheap to run:
+
+- **Q4_K** is stored in PyTorch's own 4-bit format. Each matrix multiply runs straight on the 4-bit weights, so these experts are never dequantized.
+- **Q6_K** is requantized to the same 4-bit format when packing. It loses some of Q6_K's precision, but every expert then runs on the 4-bit kernel and is read straight into its cache slot. Packs built earlier stored Q6_K as int8; they still run, but print a note asking you to rebuild.
+
+Each expert's gate and up matrices are also fused into one, so computing an expert takes two matrix multiplies instead of three.
+
+The 4-bit formats come from private PyTorch functions, so a pack records the PyTorch version it was built with. If you upgrade PyTorch, rerun `main.py pack`; an older pack still runs, but prints a note asking you to rebuild it.
+
+### On the GPU
+
+By default (when PyTorch can use Apple's GPU through MPS), `pack` stores the 4-bit experts in the layout of PyTorch's GPU 4-bit kernel, and `run` computes them on the GPU. The expert cache is memory the CPU and GPU share (Apple Silicon has one pool of RAM for both), so each expert is read from the SSD straight into memory the GPU computes from, with no extra copy. Even with `--cache-gb 0`, there are 64 such slots (about 120 MiB) to read into.
+
+The rest of the model runs on the GPU too, so the hidden state stays there. The non-expert weights are moved to GPU memory when the model loads (their CPU copies are freed, so it costs no extra RAM). On the GPU, every small operation costs about the same to issue however little work it does, and each layer has about a hundred of them, so while decoding the small steps are compiled with `torch.compile`, which fuses them into a few GPU kernels. That compile takes about a second on the first generated token, less on later runs (PyTorch caches it on disk). The KV cache grows in blocks of 256 positions, because each new tensor shape costs a fresh GPU setup. Each layer waits for the GPU once, to bring back which experts its tokens picked (and the guesses for the next layer), which the CPU needs to read them.
+
+PyTorch has no Python API for shared GPU memory, so a small Objective-C++ helper (`gguf/mps_shared.mm`) is compiled with `clang++` the first time a GPU pack runs, into `gguf/build/`. A pack's layout decides where its experts run, so to switch, rerun `pack` with `--gpu` or `--no-gpu`.
+
+### Expert cache, usage table and preload
+
+By default no experts are cached in RAM beyond the OS file cache; `--cache-gb N` sets aside N GiB for a cache of recently used ones.
+
+Each run also keeps a **usage table**: how many tokens each expert in each layer has been routed to, counting both prompt and generated tokens. It's saved to `expert_usage.json` in the pack folder after every run, and each run adds to the counts from earlier ones, so over time it records which experts this model uses most. When the model loads, each layer's most used 15% of experts are read into the cache before generating, so they start as cache hits. Experts that have never been used are skipped, and the preload never goes past the cache size. The first run on a pack has no table yet, so it preloads nothing.
+
+## Other models and formats
+
+These load, but haven't been tested the way the Q4_K_M file above has:
+
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (no IQ quants yet). Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
+- **bf16 safetensors**, the Hugging Face model folder as downloaded. This was the original path. It still works but is much slower, since each token reads about 1.9 GiB of bf16 experts (about 3 tokens/s decoding and 6 tokens/s on prompts on the 16 GB M5). It needs about 130 GB of free disk: 67 GB for the model and 60 GB for the pack, in `<model_dir>/expert_pack/`. Leave `--cache-gb` at 0 on a 16 GB machine; the OS file cache already does this job, and an extra cache causes memory pressure.
+
+  ```bash
+  .venv/bin/hf download Qwen/Qwen3.6-35B-A3B --local-dir ~/Models/Qwen3.6-35B-A3B
+  .venv/bin/python main.py pack ~/Models/Qwen3.6-35B-A3B
+  .venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B "Write a short poem about a lazy cat."
+  ```
+
+- The older **Qwen3-MoE** models (`model_type: qwen3_moe`).
 
 ## Project layout
 
 - `main.py`: the command line. It picks the GGUF code for a `.gguf` file and the safetensors code for a folder.
-- `gguf/`: the GGUF file reader (`reader.py`), dequantization and the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`), the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`), the GGUF expert-pack compiler (`compiler.py`) and the GGUF loader (`engine.py`). The loader renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes, then runs them on the model code in `safetensor/engine.py`.
+- `gguf/`: the GGUF file reader (`reader.py`); dequantization, the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the GGUF expert-pack compiler (`compiler.py`); and the GGUF loader (`engine.py`). The loader renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes, then runs them on the model code in `safetensor/engine.py`.
 - `safetensor/`: the model code shared by both formats (`engine.py`), the safetensors expert-pack compiler (`compiler.py`) and its checks.
 - `web/`: the chat page for `main.py web`: the page (`index.html`) and its server (`server.py`). Replies are rendered as Markdown with [marked](https://github.com/markedjs/marked) 16.4.2, kept in `web/vendor/` (MIT license, `marked-LICENSE.md`) so the page works offline.
 
 ## Checking correctness (optional)
 
-- `gguf/check_engine.py` runs the same model from safetensors and from a GGUF, one after the other, and compares their prompt logits and greedy replies. It needs the original model and a GGUF made from it (not a fine-tune):
+- `gguf/check_engine.py` runs the same model from safetensors and from a GGUF, one after the other, and compares their prompt logits and greedy replies. It needs the original model and a GGUF made from it, so it can't check the fine-tune above directly:
 
   ```bash
   .venv/bin/python -m gguf.check_engine ~/Models/Qwen3.6-35B-A3B ~/Models/Qwen3.6-35B-A3B-Q8_0.gguf
