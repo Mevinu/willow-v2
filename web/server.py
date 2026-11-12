@@ -151,10 +151,9 @@ def make_handler(chat: Chat):
 def run_web(model: str, max_new_tokens: int, pack_dir: str, think: bool, cache_gb: float, load,
             port: int = 8000, open_browser: bool = True):
     """Loads the model, serves the chat page on http://127.0.0.1:port, and runs the model's jobs until Ctrl-C."""
-    from safetensor.engine import Qwen35MoEEngine
     engine = load(model, pack_dir, cache_gb)
-    if not isinstance(engine, Qwen35MoEEngine):
-        raise SystemExit("web needs a Qwen3.5/3.6 model (it uses their chat format)")
+    if not engine.chat:
+        raise SystemExit("web needs a chat model (this one has no chat format)")
     engine.think = think
     chat = Chat(os.path.basename(model), think)
     server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(chat))

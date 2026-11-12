@@ -4,8 +4,15 @@ import os
 import re
 import sys
 
-from safetensor.compiler import PAGE_ALIGNMENT, PART_ORDER, align_up
 from .reader import read_gguf, model_stem
+
+# 16KB: the VM page size on Apple Silicon (and a multiple of Linux O_DIRECT's 4KB). With F_NOCACHE, reads that
+# aren't aligned to whole 16KB pages go through a bounce buffer in the kernel.
+PAGE_ALIGNMENT = 16384
+PART_ORDER = ["gate", "up", "gate_up", "down"]
+
+def align_up(size: int, alignment: int = PAGE_ALIGNMENT) -> int:
+    return -(-size // alignment) * alignment
 
 # llama.cpp stores each layer's experts stacked in one tensor: blk.N.ffn_{gate,up,down}_exps.weight
 # (or a fused ffn_gate_up_exps), PyTorch shape [num_experts, out, in], quantized along the last dim
@@ -21,8 +28,9 @@ def num_decoder_layers(metadata: dict) -> int:
 
 def scan_experts(metadata: dict, tensors: dict):
     """Works out where every expert's bytes live in the GGUF file(s), from the header alone.
-    Returns the same (num_layers, num_experts, largest expert payload, plan, part_info) as
-    safetensor.compiler.scan_experts, with ggml type names (e.g. "Q4_K") as the part dtypes."""
+    Returns (num_layers, num_experts, largest expert payload in bytes, plan, part_info): plan maps
+    (layer, expert) to its [(part, path, offset, size), ...] in PART_ORDER, and part_info maps "<layer>.<part>"
+    to its {"shape", "dtype"}, with ggml type names (e.g. "Q4_K") as the dtypes."""
     num_layers = num_decoder_layers(metadata)
     plan = {}
     part_info = {}
@@ -122,8 +130,8 @@ def compile_pack(gguf_path: str, out_dir: str = None, gpu: bool = None):
 
 def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_path: str, manifest_path: str,
                          num_layers: int, num_experts: int, max_payload: int):
-    """Writes the same pack layout as safetensor.compiler.build_expert_pack (one page-aligned block per expert),
-    but passes each part's bytes through converters["<layer>.<part>"] when there is one. plan's parts are
+    """Writes experts.pack (one page-aligned block per expert, at (layer * num_experts + expert) * stride) and its
+    manifest.json, passing each part's bytes through converters["<layer>.<part>"] when there is one. plan's parts are
     (part, [(path, offset, size), ...]), as fuse_gate_up returns them."""
     import torch
 

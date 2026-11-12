@@ -1,4 +1,2 @@
 torch
-safetensors
 tokenizers
-transformers<5  # only for check_engine.py (reference output); 5.x needs Python 3.10+

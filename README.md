@@ -139,36 +139,19 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 These load, but haven't been tested the way the Q4_K_M file above has:
 
-- **Other GGUFs** of the `qwen35moe` or `qwen3moe` architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (no IQ quants yet). Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
-- **bf16 safetensors**, the Hugging Face model folder as downloaded. This was the original path. It still works but is much slower, since each token reads about 1.9 GiB of bf16 experts (about 3 tokens/s decoding and 6 tokens/s on prompts on the 16 GB M5). It needs about 130 GB of free disk: 67 GB for the model and 60 GB for the pack, in `<model_dir>/expert_pack/`. Leave `--cache-gb` at 0 on a 16 GB machine; the OS file cache already does this job, and an extra cache causes memory pressure.
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (no IQ quants yet). Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
-  ```bash
-  .venv/bin/hf download Qwen/Qwen3.6-35B-A3B --local-dir ~/Models/Qwen3.6-35B-A3B
-  .venv/bin/python main.py pack ~/Models/Qwen3.6-35B-A3B
-  .venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B "Write a short poem about a lazy cat."
-  ```
-
-- The older **Qwen3-MoE** models (`model_type: qwen3_moe`).
+willow only runs GGUF files. The original bf16 safetensors path has been removed; see [ROADMAP.md](ROADMAP.md) for what's coming next.
 
 ## Project layout
 
-- `main.py`: the command line. It picks the GGUF code for a `.gguf` file and the safetensors code for a folder.
-- `gguf/`: the GGUF file reader (`reader.py`); dequantization, the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the GGUF expert-pack compiler (`compiler.py`); and the GGUF loader (`engine.py`). The loader renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes, then runs them on the model code in `safetensor/engine.py`.
-- `safetensor/`: the model code shared by both formats (`engine.py`), the safetensors expert-pack compiler (`compiler.py`) and its checks.
+- `main.py`: the command line.
+- `runner.py`: the terminal side of `run` and `chat`: streaming the reply and printing the stats.
+- `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization, the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); and the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`).
+- `engines/`: one package per model family, picked by the GGUF's `general.architecture` (`engines/__init__.py`).
+  - `engines/qwen36/`: Qwen3.6 (and Qwen3.5 and Qwen3-MoE). The model code (`model.py`) and its GGUF loader (`loader.py`), which renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes.
 - `web/`: the chat page for `main.py web`: the page (`index.html`) and its server (`server.py`). Replies are rendered as Markdown with [marked](https://github.com/markedjs/marked) 16.4.2, kept in `web/vendor/` (MIT license, `marked-LICENSE.md`) so the page works offline.
 
-## Checking correctness (optional)
+## Checking correctness
 
-- `gguf/check_engine.py` runs the same model from safetensors and from a GGUF, one after the other, and compares their prompt logits and greedy replies. It needs the original model and a GGUF made from it, so it can't check the fine-tune above directly:
-
-  ```bash
-  .venv/bin/python -m gguf.check_engine ~/Models/Qwen3.6-35B-A3B ~/Models/Qwen3.6-35B-A3B-Q8_0.gguf
-  ```
-
-- `safetensor/check_engine.py` compares the engine's output with Hugging Face transformers on a small Qwen3-MoE model. It needs the `transformers<5` package from `requirements.txt`.
-- `safetensor/check_qwen35_layers.py` compares individual Qwen3.6 layers against transformers' own implementation, using the real weights. It needs transformers 5, which needs Python 3.10+. See `requirements-ref.txt`:
-
-  ```bash
-  uv venv .venv-ref --python 3.12 && VIRTUAL_ENV=.venv-ref uv pip install -r requirements-ref.txt
-  .venv-ref/bin/python -m safetensor.check_qwen35_layers ~/Models/Qwen3.6-35B-A3B 0 3 39
-  ```
+The reference checks compared the engine against the original safetensors model and Hugging Face transformers, so they were removed along with the safetensors path. A GGUF-only check is on the [roadmap](ROADMAP.md).
