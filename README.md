@@ -48,7 +48,21 @@ Then chat with it:
 
 ## Commands
 
-All of these take the `.gguf` file the pack was built from. For brevity, `MODEL` below stands for `~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`.
+All of these take the `.gguf` file the pack was built from, or a model's name from `models.json` (see below). For brevity, `MODEL` below stands for `~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`.
+
+**`models.json`** lists models by name, next to `main.py`:
+
+```json
+{
+  "default": "Qwen3.8-Flash-Next",
+  "models": [
+    {"name": "Qwen3.8-Flash-Next", "path": "/path/to/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf", "cache_gb": 4},
+    {"name": "Qwen3.6-35B-A3B", "path": "/path/to/Qwen3.6-35B-A3B-Q4_K_M.gguf"}
+  ]
+}
+```
+
+Each model can also set `pack_dir`, `cache_gb` and `backbone`; a flag given on the command line wins over them. Names work anywhere a path does (`main.py chat Qwen3.6-35B-A3B`, any case). `main.py web` with no model starts with `default` (or the first model), and the web page can switch between all of them.
 
 **One prompt, one reply:**
 
@@ -73,7 +87,7 @@ The model loads once, then you type messages at the `>` prompt. The whole conver
 .venv/bin/python main.py web MODEL --cache-gb 1
 ```
 
-Once the model has loaded, it opens `http://127.0.0.1:8000`. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, **New chat** starts over, and the **Think** button toggles thinking. Reloading the page brings back the conversation so far. The page is only reachable from this computer and handles one reply at a time; Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library.
+Once the model has loaded, it opens `http://127.0.0.1:8000`. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, **New chat** starts over, and the **Think** button toggles thinking. Reloading the page brings back the conversation so far. The model menu at the top switches to another model from `models.json`. That frees the current model first (two don't fit in memory together), so it takes as long as starting willow with that model, and it starts a new chat. If the new model fails to load, the page says why and goes back to the previous one. The page is only reachable from this computer and handles one reply at a time; Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library.
 
 Decoding is greedy: it always picks the most likely next token.
 
@@ -146,6 +160,7 @@ willow only runs GGUF files. The original bf16 safetensors path has been removed
 ## Project layout
 
 - `main.py`: the command line.
+- `model_list.py`: reads `models.json` and turns a model's name into its path and settings.
 - `runner.py`: the terminal side of `run` and `chat`: streaming the reply and printing the stats.
 - `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization (with the IQ grids in `iq_grids.py`), the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`); and tables read row by row from the GGUF instead of loaded (`streamed.py`).
 - `engines/`: one package per model family, picked by the GGUF's `general.architecture` (`engines/__init__.py`). `engines/base.py` holds what they share: the expert streaming, attention and KV cache, the Gated DeltaNet layers, Qwen's chat format and the generate loop.

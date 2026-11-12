@@ -32,7 +32,16 @@
     max-width: 760px; width: 100%; margin: 0 auto;
   }
   header h1 { font-size: 15px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
-  #model { color: var(--muted); font-size: 13px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-pick { flex: 1; min-width: 0; display: flex; }
+  #model {
+    font: inherit; font-size: 13px; color: var(--muted); background: none; border: 0; border-radius: 6px;
+    padding: 4px 22px 4px 8px; max-width: 100%; text-overflow: ellipsis; cursor: pointer; appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='%238a8a84' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m4.5 6.5 3.5 3.5 3.5-3.5'/%3E%3C/svg%3E");
+    background-repeat: no-repeat; background-position: right 4px center; background-size: 14px;
+  }
+  #model:hover:not(:disabled), #model:focus-visible { color: var(--text); background-color: var(--surface); outline: 0; }
+  #model:disabled { cursor: default; opacity: .6; }
+  .empty.error { color: var(--danger); font-size: 15px; }
   #reset { color: var(--muted); font-size: 13px; padding: 4px 8px; border-radius: 6px; }
   #reset:hover:not(:disabled) { color: var(--text); background: var(--surface); }
 
@@ -119,7 +128,7 @@
 <body>
 <header>
   <h1>willow</h1>
-  <span id="model"></span>
+  <span class="model-pick"><select id="model" aria-label="Model"></select></span>
   <button id="reset" type="button">New chat</button>
 </header>
 <main id="scroll"><div id="messages"></div></main>
@@ -212,7 +221,8 @@ const ICONS = {
   send: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/></svg>',
   stop: '<svg viewBox="0 0 16 16" fill="currentColor"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>',
 };
-let busy = false, think = false;
+let busy = false, think = false, switching = false;
+const modelPick = $("model");
 
 function setThink(value) {
   think = value;
@@ -251,12 +261,43 @@ function setBusy(value) {
   busy = value;
   send.innerHTML = value ? ICONS.stop : ICONS.send;
   send.setAttribute("aria-label", value ? "Stop" : "Send");
-  reset.disabled = value;
+  updateControls();
+}
+
+function updateControls() {
+  reset.disabled = busy || switching;
+  send.disabled = switching;
+  modelPick.disabled = busy || switching || modelPick.options.length < 2;
+}
+
+function showModels(state) {
+  modelPick.replaceChildren(...state.models.map((name) => new Option(name, name)));
+  modelPick.value = state.model;
+  modelPick.title = state.model;
+  updateControls();
+}
+
+function showLoading(name) {
+  messages.innerHTML = `<div class="empty"><span class="shimmer">Loading ${esc(name)}</span></div>`;
+}
+
+// While another tab switches models, this one waits for it to finish
+async function waitForSwitch(state) {
+  switching = true;
+  updateControls();
+  showLoading(state.loading);
+  while (state.loading) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    state = await (await fetch("/api/state")).json();
+  }
+  switching = false;
+  return state;
 }
 
 async function load() {
-  const state = await (await fetch("/api/state")).json();
-  $("model").textContent = state.model;
+  let state = await (await fetch("/api/state")).json();
+  if (state.loading) state = await waitForSwitch(state);
+  showModels(state);
   setThink(Boolean(state.think));
   if (!state.history.length) return showEmpty();
   messages.replaceChildren();
@@ -322,6 +363,7 @@ async function sendMessage(text) {
 
 $("form").addEventListener("submit", (e) => {
   e.preventDefault();
+  if (switching) return;
   if (busy) { fetch("/api/stop", { method: "POST" }); return; }
   const text = input.value.trim();
   if (!text) return;
@@ -350,6 +392,37 @@ reset.addEventListener("click", async () => {
   await fetch("/api/reset", { method: "POST" });
   showEmpty();
   reset.disabled = false;
+  input.focus();
+});
+
+modelPick.addEventListener("change", async () => {
+  const name = modelPick.value, previous = modelPick.title;
+  if (messages.querySelector(".user") && !confirm(`Switching to ${name} starts a new chat. Switch?`)) {
+    modelPick.value = previous;
+    return;
+  }
+  switching = true;
+  updateControls();
+  showLoading(name);
+  let state, error;
+  try {
+    const res = await fetch("/api/model", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }),
+    });
+    state = await res.json();
+    error = res.ok ? state.error : state.error || res.statusText;
+    if (!res.ok) state = await (await fetch("/api/state")).json();
+  } catch (err) {
+    error = `Couldn't reach the model: ${err.message}`;
+    state = { model: previous, models: [...modelPick.options].map((o) => o.value) };
+  }
+  switching = false;
+  showModels(state);
+  if (error) {
+    messages.innerHTML = `<div class="empty error">${esc(error)}</div>`;
+  } else {
+    showEmpty();
+  }
   input.focus();
 });
 

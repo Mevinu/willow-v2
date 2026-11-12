@@ -34,11 +34,11 @@ class ReplyPrinter:
         print(self.PLAIN if self.thinking else "")
         self.thinking = False
 
-def run_chat(model: str, max_new_tokens: int, pack_dir: str, think: bool, cache_gb: float, load):
+def run_chat(load, max_new_tokens: int, think: bool):
     """An interactive chat (`main.py chat`). The model keeps the whole conversation in its caches, so each reply
     only processes the new message. /reset starts a new conversation; /exit, Ctrl-D or Ctrl-C quits.
-    load(model, pack_dir, cache_gb) builds the engine."""
-    engine = load(model, pack_dir, cache_gb)
+    load() builds the engine."""
+    engine = load()
     if not engine.chat:
         raise SystemExit("chat needs a chat model (this one has no chat format)")
     engine.think = think
@@ -79,11 +79,11 @@ def run_chat(model: str, max_new_tokens: int, pack_dir: str, think: bool, cache_
     finally:
         engine.experts.save_usage()
 
-def run_prompt(model: str, prompt: str, max_new_tokens: int, pack_dir: str, think: bool, cache_gb: float, load):
+def run_prompt(load, prompt: str, max_new_tokens: int, think: bool):
     """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`).
-    load(model, pack_dir, cache_gb) builds the engine."""
+    load() builds the engine."""
     start = time.perf_counter()
-    engine = load(model, pack_dir, cache_gb)
+    engine = load()
     load_seconds = time.perf_counter() - start
     engine.think = think
     if engine.chat:
