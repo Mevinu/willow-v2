@@ -276,17 +276,48 @@ def q4_k_int4_parts(raw, shape: tuple):
     scales_and_zeros = torch.stack((scale, 8 * scale - mn), dim=-1).reshape(rows, k // INT4_GROUP, 2).transpose(0, 1)
     return q.reshape(rows, k).to(torch.int32), scales_and_zeros
 
-def float_to_int4_parts(w: torch.Tensor):
-    """Quantizes a [rows, k] float weight to 4 bits, asymmetric min/max per group of 32 along k.
-    Returns (q [rows, k] int32, scales_and_zeros [k/32, rows, 2] float32) in the INT4_G32 convention."""
+INT4_SEARCH_SHRINKS = (1.0, 0.97, 0.94, 0.91, 0.88, 0.85, 0.8)  # range shrinks float_to_int4_parts(search) tries
+
+def float_to_int4_parts(w: torch.Tensor, search: bool = False):
+    """Quantizes a [rows, k] float weight to 4 bits, asymmetric per group of 32 along k.
+    Returns (q [rows, k] int32, scales_and_zeros [k/32, rows, 2] float32) in the INT4_G32 convention.
+
+    Without search, each group spans its min..max. With search, each group takes whichever of these gives the
+    least squared error: min..max shrunk about its middle by each of INT4_SEARCH_SHRINKS (clipping a few outliers
+    can round the rest more finely), or, when the group's values sit on an evenly spaced grid of at most 16 steps
+    (Q2_0 and most IQ3_XXS groups do), that grid, which then converts exactly up to the bf16 rounding of scale and
+    zero. About 10x slower; used at pack time only."""
     rows, k = w.shape
     g = w.float().reshape(rows, k // INT4_GROUP, INT4_GROUP)
     lo, hi = g.amin(dim=-1), g.amax(dim=-1)
-    # The kernel reads scale and zero as bf16, so round them first and pick q against the rounded values
-    scale = ((hi - lo) / 15).clamp_min(1e-8).to(torch.bfloat16).float()
-    zero = (lo + 8 * scale).to(torch.bfloat16).float()
-    q = torch.round((g - zero[..., None]) / scale[..., None] + 8).clamp_(0, 15).to(torch.int32)
-    return q.reshape(rows, k), torch.stack((scale, zero), dim=-1).transpose(0, 1)
+    candidates = [(lo, (hi - lo) / 15)]
+    if search:
+        span = (hi - lo).clamp_min(1e-12)
+        gaps = g.sort(dim=-1).values.diff(dim=-1)
+        step = torch.where(gaps > span[..., None] * 1e-3, gaps, torch.full_like(gaps, float("inf"))).amin(dim=-1)
+        on_grid = torch.isfinite(step) & (span / step <= 15.01)
+        candidates = [(lo, torch.where(on_grid, step, (hi - lo) / 15))]
+        for shrink in INT4_SEARCH_SHRINKS:
+            middle, half = (hi + lo) / 2, (hi - lo) / 2 * shrink
+            candidates.append((middle - half, 2 * half / 15))
+    best = None
+    for low, scale in candidates:
+        # The kernel reads scale and zero as bf16, so round them first and pick q against the rounded values
+        scale = scale.clamp_min(1e-8).to(torch.bfloat16).float()
+        zero = (low + 8 * scale).to(torch.bfloat16).float()
+        q = torch.round((g - zero[..., None]) / scale[..., None] + 8).clamp_(0, 15)
+        if best is None:
+            best = [None, q, scale, zero]
+            if not search:
+                break
+            best[0] = ((q - 8) * scale[..., None] + zero[..., None] - g).pow(2).sum(dim=-1)
+            continue
+        err = ((q - 8) * scale[..., None] + zero[..., None] - g).pow(2).sum(dim=-1)
+        better = err < best[0]
+        best = [torch.where(better, err, best[0]), torch.where(better[..., None], q, best[1]),
+                torch.where(better, scale, best[2]), torch.where(better, zero, best[3])]
+    _, q, scale, zero = best
+    return q.to(torch.int32).reshape(rows, k), torch.stack((scale, zero), dim=-1).transpose(0, 1)
 
 def q4_k_to_int4(raw: bytes, shape: tuple, gpu: bool = False) -> bytes:
     return pack_int4(*q4_k_int4_parts(raw, shape), gpu)
@@ -296,6 +327,12 @@ def q6_k_to_int4(raw: bytes, shape: tuple, gpu: bool = False) -> bytes:
     and can be read straight into its cache slot."""
     rows, k = shape
     return pack_int4(*float_to_int4_parts(dequant_q6_k(_blocks(raw, "Q6_K")).reshape(rows, k)), gpu)
+
+def requantize_to_int4(raw: bytes, shape: tuple, type_name: str, gpu: bool = False) -> bytes:
+    """Any type with a dequantizer -> INT4_G32 (INT4_G32_GPU with gpu): dequantized, then requantized with the
+    per-group search. Not exact (4-bit grids can't hold IQ4's uneven levels or Q5_0's 32 levels): on Qwen3.8's
+    experts it adds 0.7% (Q2_0) to 7.5% (Q5_0) relative error to the GGUF's weights."""
+    return pack_int4(*float_to_int4_parts(dequantize(raw, type_name, shape, torch.float32), search=True), gpu)
 
 def q6_k_to_int8(raw: bytes, shape: tuple) -> bytes:
     rows, k = shape
@@ -314,6 +351,11 @@ def int8_nbytes(shape: tuple) -> int:
 PACK_LAYOUTS = {"Q4_K": ("INT4_G32", int4_nbytes, q4_k_to_int4), "Q6_K": ("INT4_G32", int4_nbytes, q6_k_to_int4)}
 PACK_LAYOUTS_GPU = {"Q4_K": ("INT4_G32_GPU", int4_nbytes, functools.partial(q4_k_to_int4, gpu=True)),
                     "Q6_K": ("INT4_G32_GPU", int4_nbytes, functools.partial(q6_k_to_int4, gpu=True))}
+# Qwen3.8-Flash-Next's expert types (Unsloth's UD quants), requantized with the per-group search
+for _type in ("Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ2_S", "Q2_0"):
+    PACK_LAYOUTS[_type] = ("INT4_G32", int4_nbytes, functools.partial(requantize_to_int4, type_name=_type))
+    PACK_LAYOUTS_GPU[_type] = ("INT4_G32_GPU", int4_nbytes,
+                               functools.partial(requantize_to_int4, type_name=_type, gpu=True))
 INT4_LAYOUTS = {"INT4_G32", "INT4_G32_GPU"}
 INT4_ROW_MULTIPLE = 16  # torch's int4 packing needs the row count to be a multiple of 16
 
@@ -394,6 +436,48 @@ class Int4Weight:
         else:
             y = torch._weight_int4pack_mm_for_cpu(flat, self.packed, INT4_GROUP, self.scales_and_zeros)
         return y.view(*x.shape[:-1], y.shape[-1])
+
+class Int8Weight:
+    """A [rows, k] weight as int8 with one bf16 scale per row, used in place of a bf16 tensor for the non-expert
+    weights (half the memory). F.linear(x, weight) runs torch's int8 kernel (through __torch_function__), which on
+    Apple Silicon is also faster than bf16, on the CPU and the GPU. It adds about 1-2% relative error to a matmul
+    (bf16 adds 0.2%)."""
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        if func is F.linear and len(args) > 1 and isinstance(args[1], Int8Weight):
+            bias = (kwargs or {}).get("bias", args[2] if len(args) > 2 else None)
+            out = args[1].linear(args[0])
+            return out if bias is None else out + bias
+        return NotImplemented
+
+    def __init__(self, q: torch.Tensor, scales: torch.Tensor):
+        self.q, self.scales = q, scales
+        self.shape = tuple(q.shape)
+        self.nbytes = q.nbytes + scales.nbytes
+
+    @classmethod
+    def quantize(cls, w: torch.Tensor) -> "Int8Weight":
+        w = w.float()
+        # A floor on the scale, for all-zero rows (Qwen3.8 has some)
+        scales = (w.abs().amax(dim=1) / 127).clamp_min(1e-12).to(torch.bfloat16)
+        q = torch.round(w / scales.float()[:, None]).clamp_(-127, 127).to(torch.int8)
+        return cls(q.contiguous(), scales)
+
+    def to(self, device):
+        return Int8Weight(self.q.to(device), self.scales.to(device))
+
+    @property
+    def device(self):
+        return self.q.device
+
+    def dequantize(self) -> torch.Tensor:
+        return self.q.to(torch.bfloat16) * self.scales[:, None]
+
+    def linear(self, x: torch.Tensor) -> torch.Tensor:
+        flat = x.reshape(-1, x.shape[-1]).to(self.scales.dtype)
+        y = torch._weight_int8pack_mm(flat, self.q, self.scales)
+        return y.view(*x.shape[:-1], y.shape[-1]).to(x.dtype)
 
 def dequant_int8_g16(buf, offset: int, shape: tuple) -> torch.Tensor:
     """An INT8_G16 weight inside buf -> a new bf16 tensor."""

@@ -181,7 +181,7 @@ class Engine:
 
     prefix = "model."            # where the decoder's weights live in the checkpoint
     zero_centered_norm = False   # RMSNorm scales by (1 + w) instead of w
-    prefetch_top_k = 8           # next-layer experts to start reading early while decoding (0: off)
+    prefetch_top_k = 8          # next-layer experts to start reading early while decoding (0: off)
     chat = False                 # has a chat format (prompt_ids wraps the message in it), so `chat` and `web` work
 
     def __init__(self, cfg: dict, eos_ids: set, weights: dict, experts: ExpertStore, tokenizer: Tokenizer,
@@ -462,8 +462,11 @@ class Engine:
         sp = p + ".shared_expert"
         if sp + ".gate_proj.weight" in self.weights:
             t = time.perf_counter()
-            out = out + self.ops.shared_expert(x, self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"),
-                                               self.w(sp + ".down_proj.weight"), self.w(p + ".shared_expert_gate.weight"))
+            shared = (self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"), self.w(sp + ".down_proj.weight"),
+                      self.w(p + ".shared_expert_gate.weight"))
+            # Compiled only with plain tensors: torch.compile can't trace an Int8Weight (an int8 backbone)
+            run = self.ops.shared_expert if all(isinstance(w, torch.Tensor) for w in shared) else shared_expert
+            out = out + run(x, *shared)
             self.tick("shared expert", t)
         return out
 

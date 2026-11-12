@@ -8,7 +8,7 @@ import re
 import torch
 
 from gguf.compiler import EXPERT_RE, default_pack_dir, num_decoder_layers
-from gguf.quants import QuantizedEmbedding, dequantize
+from gguf.quants import Int8Weight, QuantizedEmbedding, dequantize
 from gguf.store import ExpertStore
 from gguf.tokenizer import build_tokenizer
 from .model import MoEEngine, Qwen35MoEEngine
@@ -47,6 +47,13 @@ KEEP_FLOAT32 = (".linear_attn.A_log", ".linear_attn.dt_bias")  # the engine comp
 OTHER_ZERO_CENTERED = (".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight")
 FIXED_ARCHITECTURES = ("qwen35moe", "qwen4exp")  # whose tensors go through fix_qwen35_tensor
 END_TOKENS = ("<|im_end|>", "<|endoftext|>")  # Qwen's generation_config.json stops on both
+BACKBONES = ("bf16", "int8")  # how the non-expert weights are held (see backbone_converter)
+# Kept in bf16 even with an int8 backbone: the routers (which experts run is sensitive to small changes) and
+# one-row gates. Only matmul weights can be Int8Weight, so the embedding table (looked up) and the conv weights
+# (Qwen3.8's PLE conv1d is [channels, kernel], used elementwise) never are.
+INT8_EXCLUDE = (".mlp.gate.weight", ".shared_expert_gate.weight", "embed_tokens.weight", ".conv1d.weight")
+INT8_MIN_ELEMENTS = 1 << 16
+INT8_MULTIPLE = 32  # torch's int8 kernel needs both dims to be multiples of 32
 
 def build_config(metadata: dict, tensors: dict) -> dict:
     """Rebuilds the Hugging Face config.json fields the engine reads from the GGUF metadata."""
@@ -170,11 +177,27 @@ def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict, layer_names:
         raise NotImplementedError(f"Don't know where GGUF tensor {gguf_name} goes")
     return [(p + layer_names[rest], None)]
 
+def backbone_converter(backbone: str):
+    """For load_weights' convert: "bf16" keeps every tensor as it is; "int8" turns the big 2-D matrices into
+    Int8Weight (one scale per row), about halving the non-expert weights' memory."""
+    if backbone not in BACKBONES:
+        raise ValueError(f"backbone must be one of {BACKBONES}, not {backbone!r}")
+    if backbone == "bf16":
+        return None
+
+    def convert(name: str, tensor: torch.Tensor):
+        if (tensor.dim() != 2 or tensor.numel() < INT8_MIN_ELEMENTS or name.endswith(INT8_EXCLUDE)
+                or tensor.shape[0] % INT8_MULTIPLE or tensor.shape[1] % INT8_MULTIPLE):
+            return tensor
+        return Int8Weight.quantize(tensor)
+    return convert
+
 def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict, layer_names: dict = None,
-                 global_names: dict = None) -> dict:
+                 global_names: dict = None, convert=None) -> dict:
     """Reads and dequantizes every non-expert tensor (named by hf_names). Returns {Hugging Face name: tensor}, all
     resident in RAM. A quantized embedding table stays quantized (QuantizedEmbedding), unless it doubles as the
-    output layer."""
+    output layer. convert(name, tensor), when given, replaces each tensor as it is loaded (see backbone_converter),
+    so the bf16 copies never all exist at once."""
     weights = {}
     embed_name = prefix + GLOBAL_NAMES["token_embd.weight"]
     separate_output = "output.weight" in tensors
@@ -203,7 +226,8 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict, layer_names: 
                     tensor = tensor[rows]
                 if fix:
                     tensor = fix_qwen35_tensor(name, tensor, cfg)
-                weights[name] = tensor.to(torch.float32 if keep_float32 else torch.bfloat16).contiguous()
+                tensor = tensor.to(torch.float32 if keep_float32 else torch.bfloat16).contiguous()
+                weights[name] = convert(name, tensor) if convert else tensor
     finally:
         for fd in fds.values():
             os.close(fd)
@@ -211,17 +235,18 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict, layer_names: 
 
 def load_engine(gguf_path: str, metadata: dict, tensors: dict, pack_dir: str = None, cache_gb: float = None,
                 preload: bool = True, gpu_backbone: bool = True, sync_timings: bool = False,
-                min_expert_weight: float = 0.0) -> MoEEngine:
+                min_expert_weight: float = 0.0, backbone: str = "bf16") -> MoEEngine:
     """metadata and tensors are the GGUF's header (gguf.reader.read_gguf). cache_gb None or 0 (no --cache-gb) turns
     the expert cache off. preload reads the most used experts into the cache first (see ExpertStore.preload). With
     a GPU pack, gpu_backbone also runs everything else (attention, the router, the shared expert, the output layer)
     on the GPU. sync_timings makes the per-section decode times real when the GPU is used, at some cost in speed
     (see MoEEngine.tick). min_expert_weight skips routed experts below that weight (see
-    MoEEngine.skip_small_experts)."""
+    MoEEngine.skip_small_experts). backbone is how the non-expert weights are held: "bf16" or "int8" (see
+    backbone_converter)."""
     arch = metadata["general.architecture"]
     engine_class = ARCHITECTURES[arch]
     cfg = build_config(metadata, tensors)
-    weights = load_weights(arch, engine_class.prefix, cfg, tensors)
+    weights = load_weights(arch, engine_class.prefix, cfg, tensors, convert=backbone_converter(backbone))
     return build_engine(engine_class, gguf_path, metadata, cfg, weights, pack_dir, cache_gb, preload, gpu_backbone,
                         sync_timings, min_expert_weight)
 

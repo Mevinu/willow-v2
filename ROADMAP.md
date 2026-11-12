@@ -59,11 +59,8 @@ Sizes on disk: experts 56.2 GiB, the PLE table 26.8 GiB, everything else 4.2 GiB
 - [x] `StreamedEmbedding`: looks up rows of a GGUF tensor straight from the file (`pread` per row, on a thread pool for big batches), never resident. Used for the PLE table.
 - [x] Dequantizers for IQ4_XS, IQ3_XXS and IQ2_S in `quants.py`, with ggml's grids in `gguf/iq_grids.py`. All of them, IQ4_NL included, match gguf-py exactly on real blocks of this model's tensors, so every type in the GGUF now dequantizes.
 - [x] `QuantizedEmbedding` for IQ4_XS, so `token_embd` stays quantized (it works for any type with a dequantizer).
-- [ ] A pack layout for IQ experts. Choose between:
-  - (a) requantizing to INT4_G32 at pack time, as Q6_K is today. It reuses the int4 GPU kernel, but the pack grows to about 5 bits/weight (about 1.4 GiB/token cold) and the 2–3-bit layers lose a little.
-  - (b) keeping the IQ bytes and dequantizing per read, which is simple but slow.
-  - (c) a Metal kernel that runs IQ blocks directly. Fastest and smallest, but the most work.
-  Start with (a) and measure.
+- [x] A pack layout for IQ experts: (a) requantizing to INT4_G32 (or INT4_G32_GPU) at pack time, so they run on the int4 kernels. The other options were (b) keeping the IQ bytes and dequantizing on every read (slow), and (c) a Metal kernel that runs IQ blocks directly (the most work). Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 are dequantized, then requantized. For each group of 32 values, a search picks whichever range (min..max, shrunk by up to 20%, or the values' own even grid) gives the least error. Against the GGUF's weights this adds 0.7% (Q2_0), 4.3% (IQ3_XXS), 6.8% (IQ2_S) and 7.2–7.6% (IQ4_XS, IQ4_NL, Q5_0) relative error; plain min..max would give 2.4–8.4%. Every expert becomes 2.93 MiB, so the pack is about 70.5 GiB (up from 56.4), and a cold token reads about 1.4 GiB.
+- [ ] If the 7% shows in the output: an exact GPU path for the 4-bit IQ types (a 16-entry lookup table times the block scale, then a bf16 matmul), or keeping Q5_0 at 8 bits.
 - [ ] A GGUF-only regression check that replaces the deleted reference checks: a short prompt's logits and greedy reply saved as a golden file per model.
 
 ### 3. The `qwen4exp` engine (`engines/qwen38/`)
@@ -82,7 +79,8 @@ Sizes on disk: experts 56.2 GiB, the PLE table 26.8 GiB, everything else 4.2 GiB
 
 ### 4. Make it fast on 16 GB
 
-- [ ] A memory budget: decide which non-expert weights stay 8-bit, and how big the expert cache can be.
+- [x] Non-expert weights in int8 (`Int8Weight`, one scale per row, torch's int8 kernel): 4.4 GiB instead of 9.2 GiB, and faster than bf16 on the CPU and the GPU on this Mac. They add about 1–2% relative error per matmul (bf16 adds 0.2%). The routers, the one-row gates, the conv weights and matrices with a dimension not divisible by 32 stay bf16. This is the default for Qwen3.8; `--backbone bf16` turns it off, and Qwen3.6 stays bf16 unless given `--backbone int8`. The first real run (bf16 on the CPU, 9.2 GiB on a 16 GB Mac) took 9.6 s per token, mostly in compute that should take about 0.1 s, so it was very likely swapping.
+- [ ] Expert cache size: what `--cache-gb` fits next to the 4.4 GiB backbone on 16 GB.
 - [ ] GPU paths: `torch.compile` for the hyper-connection and PLE steps, and a shared-memory slab for the 512-expert layers.
 - [ ] Tune prefetch and preload for top-10 of 512 (the usage table probably matters more with this many experts).
 - [ ] The QSA indexer, for contexts past about 2,048 tokens.
@@ -133,5 +131,5 @@ out    = v + silu(conv1d(rms_norm(v)))       # depthwise, kernel 4, dilation 3: 
 
 ## Open questions
 
-- Is IQ → int4 at pack time accurate enough for the 2-bit layers (IQ2_S gate/up and Q2_0 down on layers 8–10)?
+- Is IQ → int4 at pack time accurate enough? Q2_0 converts almost exactly, but IQ2_S (layers 8–10) and the 4-bit IQ types gain about 7% relative error (see step 2).
 - Does llama.cpp's converter change anything else that needs undoing (V-head order in the GDN layers, `ssm_a` sign, conv shapes), as it does for Qwen3.6? Check against `qwen4exp.cpp`'s tensor shapes.

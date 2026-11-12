@@ -28,6 +28,9 @@ def add_run_options(command):
     command.add_argument("--min-expert-weight", type=float, default=0.0,
                          help="Skip routed experts below this routing weight, e.g. 0.02 (default: 0, "
                               "off). Faster, but it changes the output and can lower its quality")
+    command.add_argument("--backbone", choices=("int8", "bf16"), default=None,
+                         help="How the non-expert weights are held in memory: int8 (half the memory, slightly less "
+                              "precise) or bf16 (default: int8 for Qwen3.8, bf16 for Qwen3.6)")
 
 def main():
     parser = argparse.ArgumentParser(description="Run large MoE models by streaming their experts from SSD")
@@ -67,8 +70,9 @@ def main():
     from functools import partial
     from engines import load_engine
     from runner import run_chat, run_prompt
+    options = {"backbone": args.backbone} if args.backbone else {}
     load_engine = partial(load_engine, preload=args.preload, gpu_backbone=args.gpu_backbone,
-                          sync_timings=args.sync_timings, min_expert_weight=args.min_expert_weight)
+                          sync_timings=args.sync_timings, min_expert_weight=args.min_expert_weight, **options)
     if args.command == "web":
         from web.server import run_web
         run_web(args.model, args.max_new_tokens, args.pack_dir, args.think, args.cache_gb, load_engine,

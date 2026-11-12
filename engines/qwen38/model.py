@@ -27,6 +27,7 @@ def grouped_rms_norm(x: torch.Tensor, weight: torch.Tensor, groups: int, eps: fl
     return (x32.reshape(x.shape) * (1.0 + weight.float())).type_as(x)
 
 class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
+    prefetch_top_k = 10  # Qwen3.8 routes to 10 experts
     prefix = "model.language_model."
     zero_centered_norm = True
     gdn_output_gate = "sigmoid"

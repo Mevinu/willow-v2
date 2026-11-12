@@ -110,7 +110,7 @@ Most of the time is still spent reading experts from the SSD.
 
 ### How the GGUF is run
 
-The embedding table stays quantized, and rows are dequantized as they're looked up. The other non-expert weights are dequantized to bf16 when the model loads (on Apple Silicon, bf16 matrix multiplies are faster for them than PyTorch's 4-bit kernel).
+The embedding table stays quantized, and rows are dequantized as they're looked up. The other non-expert weights are dequantized when the model loads: to bf16 for Qwen3.6, and to int8 with one scale per row for Qwen3.8 (half the memory, and torch's int8 matrix multiply is faster than bf16 on Apple Silicon). `--backbone int8` or `--backbone bf16` overrides the default.
 
 The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so `pack` stores Q4_K_M's two types in layouts that are cheap to run:
 
@@ -139,7 +139,7 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 These load, but haven't been tested the way the Q4_K_M file above has:
 
-- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 (Qwen3.8's types) are requantized to the 4-bit format when packing, with a per-group search that keeps the added error low (see ROADMAP.md). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
 willow only runs GGUF files. The original bf16 safetensors path has been removed; see [ROADMAP.md](ROADMAP.md) for what's coming next.
 

@@ -1,7 +1,9 @@
 """Loads Qwen3.8-Flash-Next (GGUF architecture qwen4exp) into model.py's engine. It shares Qwen3.6's GGUF naming
 and converter fixes (engines/qwen36/loader.py) and adds the tensors only Qwen3.8 has. The n-gram (PLE) table is
 never loaded: gguf.streamed.StreamedEmbedding reads the rows each token needs straight from the GGUF."""
-from engines.qwen36.loader import GLOBAL_NAMES, LAYER_NAMES, build_config as build_qwen_config, build_engine, load_weights
+from engines.qwen36.loader import (GLOBAL_NAMES, LAYER_NAMES, backbone_converter,
+                                   build_config as build_qwen_config,
+                                   build_engine, load_weights)
 from gguf.streamed import StreamedEmbedding
 from .model import Qwen38Engine
 
@@ -66,12 +68,14 @@ def build_config(metadata: dict, tensors: dict) -> dict:
 
 def load_engine(gguf_path: str, metadata: dict, tensors: dict, pack_dir: str = None, cache_gb: float = None,
                 preload: bool = True, gpu_backbone: bool = True, sync_timings: bool = False,
-                min_expert_weight: float = 0.0) -> Qwen38Engine:
-    """See engines/qwen36/loader.py's load_engine for the options."""
+                min_expert_weight: float = 0.0, backbone: str = "int8") -> Qwen38Engine:
+    """See engines/qwen36/loader.py's load_engine for the options. The non-expert weights default to int8: in bf16
+    they take 9.2 GiB, too much next to the expert cache on a 16 GB Mac."""
     arch = metadata["general.architecture"]
     engine_class = ARCHITECTURES[arch]
     cfg = build_config(metadata, tensors)
-    weights = load_weights(arch, engine_class.prefix, cfg, tensors, LAYER_NAMES_38, GLOBAL_NAMES_38)
+    weights = load_weights(arch, engine_class.prefix, cfg, tensors, LAYER_NAMES_38, GLOBAL_NAMES_38,
+                           backbone_converter(backbone))
     ple_table = StreamedEmbedding(tensors[PLE_TABLE]) if cfg["ple_layers"] else None
     return build_engine(engine_class, gguf_path, metadata, cfg, weights, pack_dir, cache_gb, preload, gpu_backbone,
                         sync_timings, min_expert_weight, ple_table=ple_table)
