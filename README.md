@@ -139,7 +139,7 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 These load, but haven't been tested the way the Q4_K_M file above has:
 
-- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (no IQ quants yet). Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
 willow only runs GGUF files. The original bf16 safetensors path has been removed; see [ROADMAP.md](ROADMAP.md) for what's coming next.
 
@@ -147,9 +147,9 @@ willow only runs GGUF files. The original bf16 safetensors path has been removed
 
 - `main.py`: the command line.
 - `runner.py`: the terminal side of `run` and `chat`: streaming the reply and printing the stats.
-- `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization, the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); and the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`).
-- `engines/`: one package per model family, picked by the GGUF's `general.architecture` (`engines/__init__.py`).
-  - `engines/qwen36/`: Qwen3.6 (and Qwen3.5 and Qwen3-MoE). The model code (`model.py`) and its GGUF loader (`loader.py`), which renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes.
+- `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization (with the IQ grids in `iq_grids.py`), the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`); and tables read row by row from the GGUF instead of loaded (`streamed.py`).
+- `engines/`: one package per model family, picked by the GGUF's `general.architecture` (`engines/__init__.py`). `engines/base.py` holds what they share: the expert streaming, attention and KV cache, the Gated DeltaNet layers, Qwen's chat format and the generate loop.
+  - `engines/qwen36/`: Qwen3.6 (and Qwen3.5 and Qwen3-MoE). How their layers are wired (`model.py`) and its GGUF loader (`loader.py`), which renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes.
 - `web/`: the chat page for `main.py web`: the page (`index.html`) and its server (`server.py`). Replies are rendered as Markdown with [marked](https://github.com/markedjs/marked) 16.4.2, kept in `web/vendor/` (MIT license, `marked-LICENSE.md`) so the page works offline.
 
 ## Checking correctness

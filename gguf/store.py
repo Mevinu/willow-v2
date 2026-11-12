@@ -66,7 +66,9 @@ class ExpertStore:
             raise ValueError(f"{pack_dir} is a {self.manifest.get('format', 'safetensors')} pack, which is no longer "
                              "supported; rerun `main.py pack` on the .gguf model")
         self.fd = os.open(os.path.join(pack_dir, "experts.pack"), os.O_RDONLY)
-        self.parts = {name: (tuple(info["shape"]), info["dtype"]) for name, info in self.manifest["parts"].items()}
+        # "TYPE42": Q2_0 in packs built before the reader knew its name (the bytes are the same)
+        self.parts = {name: (tuple(info["shape"]), "Q2_0" if info["dtype"] == "TYPE42" else info["dtype"])
+                      for name, info in self.manifest["parts"].items()}
         self.cache = OrderedDict()  # (layer, expert) -> weights, least recently used first (plain LRU only)
         self.cache_bytes = cache_bytes
         self.cached_bytes = 0

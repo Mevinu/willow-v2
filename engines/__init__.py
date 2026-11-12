@@ -7,6 +7,7 @@ from gguf.reader import read_gguf
 ARCHITECTURES = {
     "qwen3moe": "engines.qwen36",   # Qwen3-MoE (shares Qwen3.6's code: it's the base engine there)
     "qwen35moe": "engines.qwen36",  # Qwen3.5 / Qwen3.6 MoE
+    "qwen4exp": "engines.qwen38",   # Qwen3.8-Flash-Next
 }
 
 def load_engine(gguf_path: str, pack_dir: str = None, cache_gb: float = None, **options):

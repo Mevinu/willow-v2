@@ -43,6 +43,9 @@ LAYER_NAMES = {
 GLOBAL_NAMES = {"token_embd.weight": "embed_tokens.weight", "output_norm.weight": "norm.weight"}
 LAYER_RE = re.compile(r"^blk\.(\d+)\.(.+)$")
 KEEP_FLOAT32 = (".linear_attn.A_log", ".linear_attn.dt_bias")  # the engine computes with these in float32
+# Zero-centered norms whose names don't end in "norm.weight" (Qwen3.8's PLE), which the converter also stored as 1 + w
+OTHER_ZERO_CENTERED = (".ple.norm_key.weight", ".ple.norm_query.weight", ".ple.norm_conv.weight")
+FIXED_ARCHITECTURES = ("qwen35moe", "qwen4exp")  # whose tensors go through fix_qwen35_tensor
 END_TOKENS = ("<|im_end|>", "<|endoftext|>")  # Qwen's generation_config.json stops on both
 
 def build_config(metadata: dict, tensors: dict) -> dict:
@@ -84,7 +87,7 @@ def build_config(metadata: dict, tensors: dict) -> dict:
                 rope[hf_key] = get(f"rope.scaling.{gguf_key}")
     cfg["rope_parameters"] = rope
 
-    if arch == "qwen35moe":
+    if get("ssm.conv_kernel") is not None:  # Gated DeltaNet layers (Qwen3.5/3.6/3.8)
         recurrent = get("attention.recurrent_layers")
         if recurrent is None:
             interval = get("full_attention_interval", 4)
@@ -105,9 +108,10 @@ def v_heads_to_grouped(t: torch.Tensor, dim: int, num_k_heads: int, v_per_k: int
     return t.transpose(dim, dim + 1).reshape(shape)
 
 def fix_qwen35_tensor(name: str, t: torch.Tensor, cfg: dict) -> torch.Tensor:
-    """Reverses what convert_hf_to_gguf.py does to Qwen3.5/3.6 tensors (Qwen3NextModel and
-    _LinearAttentionVReorderBase there). t is float32."""
-    if name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+    """Reverses what llama.cpp's converter does to Qwen3.5/3.6/3.8 tensors (Qwen3NextModel and
+    _LinearAttentionVReorderBase in conversion/qwen.py, and Qwen4ExpTextModel in conversion/qwen4exp.py). t is
+    float32."""
+    if (name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight")) or name.endswith(OTHER_ZERO_CENTERED):
         t = t - 1  # the converter adds 1 to zero-centered RMSNorm weights; the engine adds it back
     elif name.endswith("linear_attn.A_log"):
         t = torch.log(-t)  # stored as A = -exp(A_log)
@@ -131,12 +135,16 @@ def fix_qwen35_tensor(name: str, t: torch.Tensor, cfg: dict) -> torch.Tensor:
         return v_heads_to_grouped(t, 1, k_heads, v_per_k, v_dim)
     return t
 
-def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict):
-    """Maps one llama.cpp tensor to [(Hugging Face name, row slice or None)]; [] for tensors the engine skips."""
+def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict, layer_names: dict = None,
+             global_names: dict = None):
+    """Maps one llama.cpp tensor to [(Hugging Face name, row slice or None)]; [] for tensors the engine skips.
+    layer_names and global_names default to LAYER_NAMES and GLOBAL_NAMES; a global name mapped to None is skipped."""
+    layer_names = LAYER_NAMES if layer_names is None else layer_names
+    global_names = GLOBAL_NAMES if global_names is None else global_names
     if gguf_name == "output.weight":
         return [("lm_head.weight", None)]
-    if gguf_name in GLOBAL_NAMES:
-        return [(prefix + GLOBAL_NAMES[gguf_name], None)]
+    if gguf_name in global_names:
+        return [] if global_names[gguf_name] is None else [(prefix + global_names[gguf_name], None)]
     m = LAYER_RE.match(gguf_name)
     if not m:
         raise NotImplementedError(f"Don't know where GGUF tensor {gguf_name} goes")
@@ -153,25 +161,27 @@ def hf_names(gguf_name: str, prefix: str, cfg: dict, tensors: dict):
         return [(p + "self_attn.q_proj.weight", slice(0, q_rows)),
                 (p + "self_attn.k_proj.weight", slice(q_rows, q_rows + kv_rows)),
                 (p + "self_attn.v_proj.weight", slice(q_rows + kv_rows, None))]
-    if rest.endswith(".bias") and rest not in LAYER_NAMES:
+    if rest.endswith(".bias") and rest not in layer_names:
         # Biases sit next to their weight: blk.N.attn_q.bias -> ...q_proj.bias
-        weight_name = LAYER_NAMES.get(rest.removesuffix(".bias") + ".weight")
+        weight_name = layer_names.get(rest.removesuffix(".bias") + ".weight")
         if weight_name:
             return [(p + weight_name.removesuffix(".weight") + ".bias", None)]
-    if rest not in LAYER_NAMES:
+    if rest not in layer_names:
         raise NotImplementedError(f"Don't know where GGUF tensor {gguf_name} goes")
-    return [(p + LAYER_NAMES[rest], None)]
+    return [(p + layer_names[rest], None)]
 
-def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
-    """Reads and dequantizes every non-expert tensor. Returns {Hugging Face name: tensor}, all resident in RAM.
-    A quantized embedding table stays quantized (QuantizedEmbedding), unless it doubles as the output layer."""
+def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict, layer_names: dict = None,
+                 global_names: dict = None) -> dict:
+    """Reads and dequantizes every non-expert tensor (named by hf_names). Returns {Hugging Face name: tensor}, all
+    resident in RAM. A quantized embedding table stays quantized (QuantizedEmbedding), unless it doubles as the
+    output layer."""
     weights = {}
     embed_name = prefix + GLOBAL_NAMES["token_embd.weight"]
     separate_output = "output.weight" in tensors
     fds = {}
     try:
         for gguf_name, t in tensors.items():
-            targets = hf_names(gguf_name, prefix, cfg, tensors)
+            targets = hf_names(gguf_name, prefix, cfg, tensors, layer_names, global_names)
             if not targets:
                 continue
             if t.path not in fds:
@@ -185,7 +195,8 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict) -> dict:
                     continue
                 # Tensors that need the converter's changes undone go through float32; the rest (including the
                 # big embedding and output tables) dequantize straight to bf16
-                fix = arch == "qwen35moe" and (".linear_attn." in name or name.endswith(("norm.weight", "_gate.weight")))
+                fix = arch in FIXED_ARCHITECTURES and (".linear_attn." in name or name.endswith(
+                    ("norm.weight", "_gate.weight") + OTHER_ZERO_CENTERED))
                 keep_float32 = name.endswith(KEEP_FLOAT32)
                 tensor = dequantize(raw, t.type, t.shape, torch.float32 if fix or keep_float32 else torch.bfloat16)
                 if rows is not None:
@@ -210,19 +221,26 @@ def load_engine(gguf_path: str, metadata: dict, tensors: dict, pack_dir: str = N
     arch = metadata["general.architecture"]
     engine_class = ARCHITECTURES[arch]
     cfg = build_config(metadata, tensors)
+    weights = load_weights(arch, engine_class.prefix, cfg, tensors)
+    return build_engine(engine_class, gguf_path, metadata, cfg, weights, pack_dir, cache_gb, preload, gpu_backbone,
+                        sync_timings, min_expert_weight)
 
+def build_engine(engine_class, gguf_path: str, metadata: dict, cfg: dict, weights: dict, pack_dir: str,
+                 cache_gb: float, preload: bool, gpu_backbone: bool, sync_timings: bool, min_expert_weight: float,
+                 **engine_options):
+    """The part of loading that every Qwen GGUF shares: the tokenizer and end tokens, the expert store, the device,
+    and the engine itself (engine_options are passed on to its constructor)."""
     tokenizer = build_tokenizer(metadata)
     vocab = tokenizer.get_vocab()
     eos_ids = {metadata[k] for k in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id") if k in metadata}
     eos_ids |= {vocab[t] for t in END_TOKENS if t in vocab}
     cfg["bos_token_id"] = metadata.get("tokenizer.ggml.bos_token_id", vocab.get("<|endoftext|>"))
 
-    weights = load_weights(arch, engine_class.prefix, cfg, tensors)
     experts = ExpertStore(pack_dir or default_pack_dir(gguf_path), int((cache_gb or 0) * 1024**3))
     if preload:
         experts.preload()
     device = "mps" if experts.gpu and gpu_backbone else "cpu"
-    engine = engine_class(cfg, eos_ids, weights, experts, tokenizer, device)
+    engine = engine_class(cfg, eos_ids, weights, experts, tokenizer, device, **engine_options)
     engine.sync_timings = sync_timings
     engine.min_expert_weight = min_expert_weight
     print(f"experts on the {'GPU' if experts.gpu else 'CPU'}, the rest on the {'GPU' if device == 'mps' else 'CPU'}")

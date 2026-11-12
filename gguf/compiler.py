@@ -118,31 +118,38 @@ def compile_pack(gguf_path: str, out_dir: str = None, gpu: bool = None):
             converters[key] = functools.partial(convert, shape=tuple(info["shape"]))
             sizes[key] = nbytes(info["shape"])
             part_info[key] = {"shape": info["shape"], "dtype": layout, "source_dtype": info["dtype"]}
-    max_payload = max(sum(sizes.get(f"{layer}.{part}", sum(src[2] for src in sources)) for part, sources in parts)
-                      for (layer, _), parts in plan.items())
+    # Each layer's experts get slots the size of its largest one: quant types differ between layers (a 2-bit layer
+    # next to a 4-bit one), and one model-wide size would pad every small expert up to the biggest
+    layer_payloads = {}
+    for (layer, _), parts in plan.items():
+        payload = sum(sizes.get(f"{layer}.{part}", sum(src[2] for src in sources)) for part, sources in parts)
+        layer_payloads[layer] = max(layer_payloads.get(layer, 0), payload)
+    max_payload = max(layer_payloads.values())
     layouts = sorted({info["dtype"] for info in part_info.values()} - set(types))
     print(f"Found {num_layers} layers x {num_experts} experts, largest expert = {max_payload / 1024**2:.2f} MiB, "
           f"types = {', '.join(types)}" + (f" (stored as {', '.join(layouts)})" if layouts else ""))
     pack_path = os.path.join(out_dir, "experts.pack")
     manifest_path = os.path.join(out_dir, "manifest.json")
-    build_converted_pack(plan, part_info, converters, pack_path, manifest_path, num_layers, num_experts, max_payload)
+    build_converted_pack(plan, part_info, converters, pack_path, manifest_path, num_layers, num_experts,
+                         layer_payloads)
     print(f"Wrote {pack_path} ({os.path.getsize(pack_path) / 1024**3:.2f} GiB) and {manifest_path}")
 
 def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_path: str, manifest_path: str,
-                         num_layers: int, num_experts: int, max_payload: int):
-    """Writes experts.pack (one page-aligned block per expert, at (layer * num_experts + expert) * stride) and its
-    manifest.json, passing each part's bytes through converters["<layer>.<part>"] when there is one. plan's parts are
-    (part, [(path, offset, size), ...]), as fuse_gate_up returns them."""
+                         num_layers: int, num_experts: int, layer_payloads: dict):
+    """Writes experts.pack (one page-aligned block per expert, layer after layer; a layer's blocks are all the size
+    of its largest expert, layer_payloads[layer] rounded up to whole pages) and its manifest.json, which records
+    where each expert is. Each part's bytes go through converters["<layer>.<part>"] when there is one. plan's parts
+    are (part, [(path, offset, size), ...]), as fuse_gate_up returns them."""
     import torch
 
-    stride = align_up(max_payload, PAGE_ALIGNMENT)
+    strides = [align_up(layer_payloads[layer], PAGE_ALIGNMENT) for layer in range(num_layers)]
     manifest = {
         "format": "gguf",
         "alignment": PAGE_ALIGNMENT,
         "data_start": 0,
         "num_layers": num_layers,
         "num_experts": num_experts,
-        "expert_stride": stride,
+        "layer_strides": strides,
         "parts": part_info,
         "experts": {},
         # The int4 layouts come from private torch functions, so the engine checks it runs the same version
@@ -151,7 +158,9 @@ def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_pat
     fds = {}
     try:
         with open(pack_path, "wb") as pack_file:
+            file_offset = 0
             for layer in range(num_layers):
+                stride = strides[layer]
                 for expert in range(num_experts):
                     parts, payload = {}, bytearray()
                     for part, sources in plan[(layer, expert)]:
@@ -169,7 +178,6 @@ def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_pat
                         payload += data
                     if len(payload) > stride:
                         raise ValueError(f"Expert payload ({len(payload)}B) exceeds aligned stride ({stride}B)")
-                    file_offset = (layer * num_experts + expert) * stride
                     assert pack_file.tell() == file_offset
                     pack_file.write(payload + bytes(stride - len(payload)))
                     manifest["experts"][f"{layer}_{expert}"] = {
@@ -177,6 +185,7 @@ def build_converted_pack(plan: dict, part_info: dict, converters: dict, pack_pat
                         "read_length": align_up(len(payload), PAGE_ALIGNMENT),
                         "parts": parts,
                     }
+                    file_offset += stride
                 print(f"  layer {layer + 1}/{num_layers} packed", flush=True)
     finally:
         for fd in fds.values():
