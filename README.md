@@ -48,7 +48,21 @@ Then chat with it:
 
 ## Commands
 
-All of these take the `.gguf` file the pack was built from. For brevity, `MODEL` below stands for `~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`.
+All of these take the `.gguf` file the pack was built from, or a model's name from `models.json` (see below). For brevity, `MODEL` below stands for `~/Models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf`.
+
+**`models.json`** lists models by name, next to `main.py`:
+
+```json
+{
+  "default": "Qwen3.8-Flash-Next",
+  "models": [
+    {"name": "Qwen3.8-Flash-Next", "path": "/path/to/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf", "cache_gb": 4},
+    {"name": "Qwen3.6-35B-A3B", "path": "/path/to/Qwen3.6-35B-A3B-Q4_K_M.gguf"}
+  ]
+}
+```
+
+Each model can also set `pack_dir`, `cache_gb` and `backbone`; a flag given on the command line wins over them. Names work anywhere a path does (`main.py chat Qwen3.6-35B-A3B`, any case). `main.py web` with no model starts with `default` (or the first model), and the web page can switch between all of them.
 
 **One prompt, one reply:**
 
@@ -73,7 +87,7 @@ The model loads once, then you type messages at the `>` prompt. The whole conver
 .venv/bin/python main.py web MODEL --cache-gb 1
 ```
 
-Once the model has loaded, it opens `http://127.0.0.1:8000`. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, **New chat** starts over, and the **Think** button toggles thinking. Reloading the page brings back the conversation so far. The page is only reachable from this computer and handles one reply at a time; Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library.
+Once the model has loaded, it opens `http://127.0.0.1:8000`. Use `--port` to pick another port, or `--no-browser` to open the page yourself. Replies stream in as they're written. **Stop** ends a reply after the current token and keeps the conversation going, **New chat** starts over, and the **Think** button toggles thinking. Reloading the page brings back the conversation so far. The model menu at the top switches to another model from `models.json`. That frees the current model first (two don't fit in memory together), so it takes as long as starting willow with that model, and it starts a new chat. If the new model fails to load, the page says why and goes back to the previous one. The page is only reachable from this computer and handles one reply at a time; Ctrl-C in the terminal quits. Nothing extra needs installing: the page is `web/index.html`, served by `web/server.py` with Python's standard library.
 
 Decoding is greedy: it always picks the most likely next token.
 
@@ -110,7 +124,7 @@ Most of the time is still spent reading experts from the SSD.
 
 ### How the GGUF is run
 
-The embedding table stays quantized, and rows are dequantized as they're looked up. The other non-expert weights are dequantized to bf16 when the model loads (on Apple Silicon, bf16 matrix multiplies are faster for them than PyTorch's 4-bit kernel).
+The embedding table stays quantized, and rows are dequantized as they're looked up. The other non-expert weights are dequantized when the model loads: to bf16 for Qwen3.6, and to int8 with one scale per row for Qwen3.8 (half the memory, and torch's int8 matrix multiply is faster than bf16 on Apple Silicon). `--backbone int8` or `--backbone bf16` overrides the default.
 
 The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so `pack` stores Q4_K_M's two types in layouts that are cheap to run:
 
@@ -139,36 +153,20 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 These load, but haven't been tested the way the Q4_K_M file above has:
 
-- **Other GGUFs** of the `qwen35moe` or `qwen3moe` architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K (no IQ quants yet). Anything other than Q4_K and Q6_K is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
-- **bf16 safetensors**, the Hugging Face model folder as downloaded. This was the original path. It still works but is much slower, since each token reads about 1.9 GiB of bf16 experts (about 3 tokens/s decoding and 6 tokens/s on prompts on the 16 GB M5). It needs about 130 GB of free disk: 67 GB for the model and 60 GB for the pack, in `<model_dir>/expert_pack/`. Leave `--cache-gb` at 0 on a 16 GB machine; the OS file cache already does this job, and an extra cache causes memory pressure.
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 (Qwen3.8's types) are requantized to the 4-bit format when packing, with a per-group search that keeps the added error low (see ROADMAP.md). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
-  ```bash
-  .venv/bin/hf download Qwen/Qwen3.6-35B-A3B --local-dir ~/Models/Qwen3.6-35B-A3B
-  .venv/bin/python main.py pack ~/Models/Qwen3.6-35B-A3B
-  .venv/bin/python main.py run ~/Models/Qwen3.6-35B-A3B "Write a short poem about a lazy cat."
-  ```
-
-- The older **Qwen3-MoE** models (`model_type: qwen3_moe`).
+willow only runs GGUF files. The original bf16 safetensors path has been removed; see [ROADMAP.md](ROADMAP.md) for what's coming next.
 
 ## Project layout
 
-- `main.py`: the command line. It picks the GGUF code for a `.gguf` file and the safetensors code for a folder.
-- `gguf/`: the GGUF file reader (`reader.py`); dequantization, the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the GGUF expert-pack compiler (`compiler.py`); and the GGUF loader (`engine.py`). The loader renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes, then runs them on the model code in `safetensor/engine.py`.
-- `safetensor/`: the model code shared by both formats (`engine.py`), the safetensors expert-pack compiler (`compiler.py`) and its checks.
+- `main.py`: the command line.
+- `model_list.py`: reads `models.json` and turns a model's name into its path and settings.
+- `runner.py`: the terminal side of `run` and `chat`: streaming the reply and printing the stats.
+- `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization (with the IQ grids in `iq_grids.py`), the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`); and tables read row by row from the GGUF instead of loaded (`streamed.py`).
+- `engines/`: one package per model family, picked by the GGUF's `general.architecture` (`engines/__init__.py`). `engines/base.py` holds what they share: the expert streaming, attention and KV cache, the Gated DeltaNet layers, Qwen's chat format and the generate loop.
+  - `engines/qwen36/`: Qwen3.6 (and Qwen3.5 and Qwen3-MoE). How their layers are wired (`model.py`) and its GGUF loader (`loader.py`), which renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes.
 - `web/`: the chat page for `main.py web`: the page (`index.html`) and its server (`server.py`). Replies are rendered as Markdown with [marked](https://github.com/markedjs/marked) 16.4.2, kept in `web/vendor/` (MIT license, `marked-LICENSE.md`) so the page works offline.
 
-## Checking correctness (optional)
+## Checking correctness
 
-- `gguf/check_engine.py` runs the same model from safetensors and from a GGUF, one after the other, and compares their prompt logits and greedy replies. It needs the original model and a GGUF made from it, so it can't check the fine-tune above directly:
-
-  ```bash
-  .venv/bin/python -m gguf.check_engine ~/Models/Qwen3.6-35B-A3B ~/Models/Qwen3.6-35B-A3B-Q8_0.gguf
-  ```
-
-- `safetensor/check_engine.py` compares the engine's output with Hugging Face transformers on a small Qwen3-MoE model. It needs the `transformers<5` package from `requirements.txt`.
-- `safetensor/check_qwen35_layers.py` compares individual Qwen3.6 layers against transformers' own implementation, using the real weights. It needs transformers 5, which needs Python 3.10+. See `requirements-ref.txt`:
-
-  ```bash
-  uv venv .venv-ref --python 3.12 && VIRTUAL_ENV=.venv-ref uv pip install -r requirements-ref.txt
-  .venv-ref/bin/python -m safetensor.check_qwen35_layers ~/Models/Qwen3.6-35B-A3B 0 3 39
-  ```
+The reference checks compared the engine against the original safetensors model and Hugging Face transformers, so they were removed along with the safetensors path. A GGUF-only check is on the [roadmap](ROADMAP.md).

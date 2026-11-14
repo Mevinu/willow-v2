@@ -44,6 +44,7 @@ GGML_TYPES = {
     34: ("TQ1_0", QK_K, 2 + 4 * 13),
     35: ("TQ2_0", QK_K, 2 + 64),
     39: ("MXFP4", 32, 1 + 16),
+    42: ("Q2_0", 64, 2 + 16),  # newer ggml: an fp16 scale, then 2 bits per value
 }
 BLOCK_SIZES = {name: (elements, size) for name, elements, size in GGML_TYPES.values()}
 

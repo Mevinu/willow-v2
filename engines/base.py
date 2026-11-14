@@ -1,28 +1,15 @@
-import os
-import sys
+"""The parts every MoE engine shares (see Engine), plus the Gated DeltaNet linear attention and Qwen's chat format,
+which several Qwen models share (GatedDeltaNet, QwenChat). Weights use Hugging Face names; each model's loader maps
+the GGUF's names to them. The routed experts are streamed from the expert pack by gguf.store.ExpertStore."""
 import math
-import json
 import time
-import threading
-from collections import OrderedDict, defaultdict
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from itertools import islice
+from collections import defaultdict
 
 import torch
 import torch.nn.functional as F
-from safetensors import safe_open
 from tokenizers import Tokenizer
 
-from .compiler import EXPERT_RE, build_index_map
-
-SAFETENSORS_DTYPES = {
-    "F32": torch.float32,
-    "F16": torch.float16,
-    "BF16": torch.bfloat16,
-}
-
-# Weights the text engine never uses: vision encoder and the multi-token-prediction head
-SKIP_PREFIXES = ("model.visual.", "mtp.")
+from gguf.store import ExpertStore
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = x.chunk(2, dim=-1)
@@ -79,9 +66,9 @@ def shared_expert(x, gate_w, up_w, down_w, shared_gate_w) -> torch.Tensor:
     return torch.sigmoid(F.linear(x, shared_gate_w)) * h
 
 def linear_attention_step(mixed, z, b, a, conv_state, conv_w, A_log, dt_bias, norm_w, state,
-                          k_heads: int, v_heads: int, k_dim: int, v_dim: int, eps: float):
+                          k_heads: int, v_heads: int, k_dim: int, v_dim: int, eps: float, sigmoid_gate: bool):
     """One decode token of Gated DeltaNet, after its input projections: the same as Qwen35MoEEngine's
-    linear_attention + gated_delta_rule for seq_len 1. Returns (output [1, v_heads * v_dim] for out_proj,
+    GatedDeltaNet.linear_attention + gated_delta_rule for seq_len 1. Returns (output [1, v_heads * v_dim] for out_proj,
     new conv state, new recurrent state)."""
     key_dim = k_heads * k_dim
     window = torch.cat((conv_state, mixed))  # [kernel, channels]
@@ -101,10 +88,11 @@ def linear_attention_step(mixed, z, b, a, conv_state, conv_w, A_log, dt_bias, no
     delta = (v.float() - predicted) * beta[:, None]
     state = state + k[:, :, None] * delta[:, None, :]
     out = torch.einsum("hkv,hk->hv", state, q).to(mixed.dtype)
-    # Gated RMSNorm per head: norm(out) * w * silu(z)
+    # Gated RMSNorm per head: norm(out) * w * gate(z)
     o32 = out.float()
     o32 = o32 * torch.rsqrt(o32.pow(2).mean(-1, keepdim=True) + eps)
-    out = (norm_w * o32.to(out.dtype) * F.silu(z.view(v_heads, v_dim).float())).to(out.dtype)
+    zf = z.view(v_heads, v_dim).float()
+    out = (norm_w * o32.to(out.dtype) * (torch.sigmoid(zf) if sigmoid_gate else F.silu(zf))).to(out.dtype)
     return out.reshape(1, v_heads * v_dim), window[1:], state
 
 class Ops:
@@ -117,7 +105,7 @@ class Ops:
 
     def __init__(self, compile: bool):
         self.compiled = compile
-        self.decoding = False  # set by MoEEngine.forward: compiled versions are used only while this is True
+        self.decoding = False  # set by Engine.forward: compiled versions are used only while this is True
         if compile:
             import logging
             import torch._dynamo
@@ -181,220 +169,25 @@ def compute_inv_freq(cfg: dict, head_dim: int):
     inv_freq = (1.0 / (factor * pos_freqs)) * (1 - extrapolation_factor) + (1.0 / pos_freqs) * extrapolation_factor
     return inv_freq, attention_factor
 
-PREFETCH_MAX_IN_FLIGHT = 4  # default ExpertStore.prefetch_max_in_flight
 # The KV cache grows in steps of this many positions, and attention always runs over the whole allocated length
 # (the unused end masked off). On the GPU every new tensor shape costs a fresh setup of each op (~11 ms per
 # attention layer when the cache grew by one position per token), so the shapes only change every KV_BLOCK tokens.
 KV_BLOCK = 256
 
-def expert_weights(parts: dict) -> tuple:
-    """An expert's parts by name -> (gate_up, down) when gate and up are fused into one
-    [2 * intermediate, hidden] matrix (gate rows first), else (gate, up, down)."""
-    if "gate_up" in parts:
-        return parts["gate_up"], parts["down"]
-    return parts["gate"], parts["up"], parts["down"]
-
-class ExpertStore:
-    """Reads one expert's [gate | up | down] (or [gate_up | down]) block from the pack with a single aligned read.
-    A layer's experts are read in parallel on a thread pool (os.preadv releases the GIL), so the SSD has many
-    requests in flight and later reads finish while earlier experts are being computed.
-    Recently used experts are kept in an LRU cache of up to cache_bytes."""
-
-    # prefetch does nothing while this many reads are already running (None: never skip). The pool runs reads in
-    # the order they were submitted, so even uncapped, guesses only start once the current layer's reads have.
-    prefetch_max_in_flight = PREFETCH_MAX_IN_FLIGHT
-
-    pack_format = "safetensors"  # the manifest's "format"; packs from before the field existed are safetensors
-
-    def __init__(self, pack_dir: str, cache_bytes: int = 0, read_threads: int = 8, read_ahead: int = 16):
-        with open(os.path.join(pack_dir, "manifest.json")) as f:
-            self.manifest = json.load(f)
-        if "parts" not in self.manifest:
-            raise ValueError(f"{pack_dir} was built by an older main.py; rerun `main.py pack` on the model to rebuild it")
-        if self.manifest.get("format", "safetensors") != self.pack_format:
-            raise ValueError(f"{pack_dir} is a {self.manifest.get('format', 'safetensors')} pack, "
-                             f"but the model is {self.pack_format}; rerun `main.py pack` on this model")
-        self.fd = os.open(os.path.join(pack_dir, "experts.pack"), os.O_RDONLY)
-        self.parts = {name: (tuple(info["shape"]), info["dtype"]) for name, info in self.manifest["parts"].items()}
-        self.cache = OrderedDict()  # (layer, expert) -> (gate, up, down), least recently used first
-        self.cache_bytes = cache_bytes
-        self.cached_bytes = 0
-        self.hits = 0
-        self.reads = 0
-        self.bytes_read = 0
-        self.read_seconds = 0.0  # wall time with at least one read in flight (not summed per thread)
-        self.pool = ThreadPoolExecutor(read_threads)
-        self.read_ahead = read_ahead  # max experts requested but not yet consumed (bounds memory during prefill)
-        self.lock = threading.Lock()
-        self.in_flight = 0
-        self.busy_since = 0.0
-        self.busy = set()     # (layer, expert) handed out by load_many and not yet consumed
-        self.prefetched = {}  # (layer, expert) -> (future, token): prefetch reads not yet picked up
-        self.prefetches = 0       # prefetch reads started
-        self.prefetch_used = 0    # of those, ones load_many then asked for
-
-    def load_many(self, layer: int, experts: list):
-        """Starts loading a layer's experts and returns an iterator of (expert, weights), where weights is
-        (gate_up, down) or (gate, up, down). The reads for misses are submitted before this returns (up to
-        read_ahead of them; for a decode step, all), so the SSD works on them while the caller computes the
-        cache hits, which come first. Misses then come in the order their reads finish."""
-        keys = [(layer, expert) for expert in experts]
-        self.collect_prefetches(layer, exclude=set(keys))
-        self.busy.update(keys)  # their cache entries must not be evicted until they have been consumed
-        hits, misses = [], []
-        for key in keys:
-            weights = self.lookup(key)
-            if weights is None and key in self.prefetched and self.prefetched[key][0].done():
-                future, token = self.prefetched.pop(key)  # a prefetch that has already finished: as good as a hit
-                weights = self.finish_read(key, future.result(), token)
-                self.prefetch_used += 1
-            if weights is not None:
-                hits.append((key[1], weights))
-            else:
-                misses.append(key[1])
-
-        reads = {}  # future -> (expert, token for finish_read)
-        def start(expert):
-            key = (layer, expert)
-            if key in self.prefetched:  # prefetched, still reading
-                self.prefetch_used += 1
-                future, token = self.prefetched.pop(key)
-            else:
-                future, token = self.start_read(layer, expert)
-            reads[future] = (expert, token)
-
-        pending = iter(misses)
-        for expert in islice(pending, self.read_ahead):
-            start(expert)
-        return self.results(layer, keys, hits, reads, pending, start)
-
-    def results(self, layer: int, keys: list, hits: list, reads: dict, pending, start):
-        try:
-            for expert, weights in hits:
-                yield expert, weights
-                self.busy.discard((layer, expert))
-            while reads:
-                done, _ = wait(reads, return_when=FIRST_COMPLETED)
-                for future in done:
-                    expert, token = reads.pop(future)
-                    weights = self.finish_read((layer, expert), future.result(), token)
-                    following = next(pending, None)
-                    if following is not None:
-                        start(following)
-                    yield expert, weights
-                    self.busy.discard((layer, expert))
-        finally:
-            self.busy.difference_update(keys)
-
-    def prefetch(self, layer: int, experts: list):
-        """Starts reading experts that will probably be needed soon, without waiting for them. load_many reuses
-        these reads (they are never read twice); ones it never asks for go into the cache once they finish, or
-        are dropped if there is no cache. Skipped while the current layer still has prefetch_max_in_flight or
-        more reads in flight, so guesses never hold up reads that are actually needed."""
-        if self.prefetch_max_in_flight is not None and self.in_flight >= self.prefetch_max_in_flight:
-            return
-        for expert in experts:
-            key = (layer, expert)
-            if key in self.cache or key in self.prefetched:
-                continue
-            started = self.start_read(layer, expert, prefetch=True)
-            if started is None:
-                break
-            self.prefetched[key] = started
-            self.prefetches += 1
-
-    def collect_prefetches(self, layer: int, exclude: set = frozenset()):
-        """Deals with prefetches load_many isn't asking for, as it starts on layer: finished ones go into the cache.
-        Without a cache, a guess is only worth anything to the layer it was made for, so guesses for this layer
-        or earlier are dropped (cancelled, if their read hasn't started). Runs on the main thread."""
-        for key, (future, token) in list(self.prefetched.items()):
-            if key in exclude:
-                continue
-            if not self.cache_bytes and key[0] <= layer:
-                del self.prefetched[key]
-                future.cancel()
-            elif future.done():
-                del self.prefetched[key]
-                self.finish_read(key, future.result(), token)
-
-    def lookup(self, key):
-        """Returns a cached expert's weights (marking it most recently used), or None."""
-        weights = self.cache.get(key)
-        if weights is not None:
-            self.cache.move_to_end(key)
-            self.hits += 1
-        return weights
-
-    def start_read(self, layer: int, expert: int, prefetch: bool = False):
-        """Submits a read to the pool. Returns (future, token passed to finish_read), or None to skip a prefetch."""
-        return self.pool.submit(self.read, layer, expert), None
-
-    def finish_read(self, key, weights, token):
-        """Called on the main thread once a read is done, with what the read returned. Returns the weights."""
-        self.remember(key, weights)
-        return weights
-
-    def remember(self, key, weights):
-        size = sum(t.numel() * t.element_size() for t in weights)
-        if size <= self.cache_bytes:
-            while self.cached_bytes + size > self.cache_bytes:
-                _, evicted = self.cache.popitem(last=False)
-                self.cached_bytes -= sum(t.numel() * t.element_size() for t in evicted)
-            self.cache[key] = weights
-            self.cached_bytes += size
-
-    def read(self, layer: int, expert: int):
-        """Reads one expert from the pack. Runs on the thread pool."""
-        entry = self.manifest["experts"][f"{layer}_{expert}"]
-        block = bytearray(entry["read_length"])
-        with self.lock:
-            if self.in_flight == 0:
-                self.busy_since = time.perf_counter()
-            self.in_flight += 1
-        try:
-            # Reads straight into block (os.pread would return bytes that then need copying)
-            got = os.preadv(self.fd, [block], entry["file_offset"])
-        finally:
-            with self.lock:
-                self.in_flight -= 1
-                if self.in_flight == 0:
-                    self.read_seconds += time.perf_counter() - self.busy_since
-        if got != len(block):
-            raise IOError(f"short read for expert {layer}_{expert}: {got} of {len(block)} bytes")
-        with self.lock:
-            self.reads += 1
-            self.bytes_read += len(block)
-
-        weights = {name: self.part_tensor(block, layer, name, part) for name, part in entry["parts"].items()}
-        return expert_weights(weights)
-
-    def part_tensor(self, block: bytearray, layer: int, name: str, part: dict) -> torch.Tensor:
-        """Turns one part's bytes inside a read block into a weight tensor (no copy: it views the block)."""
-        shape, dtype = self.parts[name]
-        tensor = torch.frombuffer(block, dtype=SAFETENSORS_DTYPES[dtype], count=math.prod(shape), offset=part["offset"])
-        return tensor.view(shape)
-
-    def record_usage(self, layer: int, selected: torch.Tensor):
-        """Called by moe with the experts each token was routed to. The GGUF store counts them; this one doesn't."""
-
-    def save_usage(self):
-        """Called once a run is done, to save what record_usage counted."""
-
-    def close(self):
-        self.pool.shutdown()
-        os.close(self.fd)
-
-class MoEEngine:
-    """Qwen3-MoE. Subclasses override the pieces that differ for other architectures."""
+class Engine:
+    """What every MoE engine here shares: the device and weights, RoPE, full attention with its KV cache, the routed
+    experts streamed from the pack (moe), and generation with its stats. A model subclass writes forward (how its
+    layers are wired), router_guess_input, and any token mixers of its own."""
 
     prefix = "model."            # where the decoder's weights live in the checkpoint
     zero_centered_norm = False   # RMSNorm scales by (1 + w) instead of w
-    prefetch_top_k = 8           # next-layer experts to start reading early while decoding (0: off)
+    prefetch_top_k = 8          # next-layer experts to start reading early while decoding (0: off)
+    chat = False                 # has a chat format (prompt_ids wraps the message in it), so `chat` and `web` work
 
     def __init__(self, cfg: dict, eos_ids: set, weights: dict, experts: ExpertStore, tokenizer: Tokenizer,
                  device: str = "cpu"):
-        """cfg is the (text) config.json, and weights maps Hugging Face tensor names to every non-expert tensor.
-        load_engine builds these from a safetensors folder, gguf.engine.load_engine from a .gguf file.
+        """cfg holds the Hugging Face config.json fields the engine reads, and weights maps Hugging Face tensor
+        names to every non-expert tensor; loader.load_engine builds both from a .gguf file.
         device runs everything except the experts there (the experts run where their weights are): "mps" moves
         the non-expert weights to the GPU, freeing their CPU copies, and keeps the hidden state there."""
         self.cfg = cfg
@@ -540,11 +333,16 @@ class MoEEngine:
         if residual is None or not self.prefetch_top_k or following >= self.num_layers or residual.shape[0] != 1:
             return None
         p = f"{self.prefix}layers.{following}"
-        logits = self.linear(self.rms_norm(residual, p + ".post_attention_layernorm.weight"), p + ".mlp.gate")
+        logits = self.linear(self.router_guess_input(residual, following), p + ".mlp.gate")
         top = logits[0].topk(self.prefetch_top_k)
         if self.min_expert_weight:
             self.guess_weights = F.softmax(top.values, dim=-1, dtype=torch.float32)
         return top.indices
+
+    def router_guess_input(self, residual: torch.Tensor, layer: int) -> torch.Tensor:
+        """An approximation of what layer's router will see, from the residual stream before the current layer's
+        experts (see guess_next_layer)."""
+        raise NotImplementedError
 
     def skip_small_experts(self, routing_weights: torch.Tensor, selected: torch.Tensor, guess):
         """Drops routed experts below min_expert_weight, trading some accuracy for fewer reads and matmuls. Each
@@ -608,7 +406,7 @@ class MoEEngine:
 
         # Run every token routed to each expert as it arrives (cache hits first, then reads as they finish).
         # "expert load" is only the time spent waiting for a read that hasn't finished yet.
-        # An expert whose weights are all on the GPU (a GGUF pack built with --gpu) is computed there, and its
+        # An expert whose weights are all on the GPU (a pack built with --gpu) is computed there, and its
         # output stays there until the layer's sum is copied back once, so the CPU doesn't wait on every expert.
         # Copies to the GPU don't wait (a waiting copy waits for all queued GPU work: ~0.2 ms each), so their CPU
         # sources are kept in self.keep_alive until the GPU's next wait (the copy back below, or the next layer's
@@ -664,30 +462,25 @@ class MoEEngine:
         sp = p + ".shared_expert"
         if sp + ".gate_proj.weight" in self.weights:
             t = time.perf_counter()
-            out = out + self.ops.shared_expert(x, self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"),
-                                               self.w(sp + ".down_proj.weight"), self.w(p + ".shared_expert_gate.weight"))
+            shared = (self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"), self.w(sp + ".down_proj.weight"),
+                      self.w(p + ".shared_expert_gate.weight"))
+            # Compiled only with plain tensors: torch.compile can't trace an Int8Weight (an int8 backbone)
+            run = self.ops.shared_expert if all(isinstance(w, torch.Tensor) for w in shared) else shared_expert
+            out = out + run(x, *shared)
             self.tick("shared expert", t)
         return out
 
     @torch.no_grad()
     def forward(self, token_ids: list) -> torch.Tensor:
-        """Runs new tokens through the model, extending the caches. Returns logits for each token."""
-        self.ops.decoding = len(token_ids) == 1
+        """Runs new tokens through the model, extending the caches (and self.position). Returns logits for each
+        token. Set self.ops.decoding = len(token_ids) == 1 first."""
+        raise NotImplementedError
+
+    def embed(self, token_ids: list) -> torch.Tensor:
+        """The token embeddings [tokens, hidden], on self.device."""
         table, ids = self.w(self.prefix + "embed_tokens.weight"), torch.tensor(token_ids)
-        # A GGUF table kept quantized (gguf.quants.QuantizedEmbedding) looks rows up on the CPU
-        x = table[self.to_device(ids)] if isinstance(table, torch.Tensor) else self.to_device(table[ids])
-        cos, sin = self.rope(len(token_ids))
-        for layer in range(self.num_layers):
-            p = f"{self.prefix}layers.{layer}"
-            t = time.perf_counter()
-            x = x + self.token_mixer(self.rms_norm(x, p + ".input_layernorm.weight"), layer, cos, sin)
-            self.tick(self.layer_types[layer].replace("_", " "), t)
-            x = x + self.moe(self.rms_norm(x, p + ".post_attention_layernorm.weight"), layer, residual=x)
-        self.position += len(token_ids)
-        t = time.perf_counter()
-        logits = F.linear(self.rms_norm(x, self.prefix + "norm.weight"), self.w("lm_head.weight"))
-        self.tick("lm_head", t)
-        return logits
+        # A table kept quantized (gguf.quants.QuantizedEmbedding) looks rows up on the CPU
+        return table[self.to_device(ids)] if isinstance(table, torch.Tensor) else self.to_device(table[ids])
 
     def prompt_ids(self, prompt: str) -> list:
         return [self.cfg["bos_token_id"]] + self.tokenizer.encode(prompt, add_special_tokens=False).ids
@@ -762,31 +555,24 @@ class MoEEngine:
             print()
         return ids
 
-class Qwen35MoEEngine(MoEEngine):
-    """Qwen3.5/3.6-MoE: hybrid Gated DeltaNet (linear attention) + gated full attention, plus a shared expert."""
 
-    prefix = "model.language_model."
-    zero_centered_norm = True
 
-    def setup(self, cfg: dict):
-        super().setup(cfg)
-        self.norm_topk_prob = True  # Qwen3.5's router always renormalizes the top-k weights
+class GatedDeltaNet:
+    """Gated DeltaNet linear attention (Qwen3.5/3.6/3.8), for an Engine whose layer_types include
+    "linear_attention". Call setup_linear_attention from setup and reset_linear_attention from reset."""
+
+    gdn_output_gate = "silu"  # the output norm's gate: silu (Qwen3.5/3.6) or sigmoid (Qwen3.8)
+
+    def setup_linear_attention(self, cfg: dict):
         self.lin_k_heads = cfg["linear_num_key_heads"]
         self.lin_v_heads = cfg["linear_num_value_heads"]
         self.lin_k_dim = cfg["linear_key_head_dim"]
         self.lin_v_dim = cfg["linear_value_head_dim"]
         self.conv_kernel = cfg["linear_conv_kernel_dim"]
-        self.think = False
 
-    def reset(self):
-        super().reset()
+    def reset_linear_attention(self):
         self.conv_state = [None] * self.num_layers       # last (kernel - 1) conv inputs per linear layer
         self.recurrent_state = [None] * self.num_layers  # [v_heads, k_dim, v_dim] fp32 per linear layer
-
-    def token_mixer(self, x: torch.Tensor, layer: int, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
-        if self.layer_types[layer] == "linear_attention":
-            return self.linear_attention(x, layer)
-        return self.attention(x, layer, cos, sin)
 
     def linear_attention(self, x: torch.Tensor, layer: int) -> torch.Tensor:
         p = f"{self.prefix}layers.{layer}.linear_attn"
@@ -803,7 +589,8 @@ class Qwen35MoEEngine(MoEEngine):
             out, self.conv_state[layer], self.recurrent_state[layer] = self.ops.linear_attention_step(
                 mixed, z, b, a, self.conv_state[layer], self.w(p + ".conv1d.weight"), self.w(p + ".A_log"),
                 self.w(p + ".dt_bias"), self.w(p + ".norm.weight"), self.recurrent_state[layer],
-                self.lin_k_heads, self.lin_v_heads, self.lin_k_dim, self.lin_v_dim, self.eps)
+                self.lin_k_heads, self.lin_v_heads, self.lin_k_dim, self.lin_v_dim, self.eps,
+                self.gdn_output_gate == "sigmoid")
             return self.linear(out, p + ".out_proj")
 
         # Causal depthwise conv over time, continuing from the previous (kernel - 1) inputs
@@ -831,10 +618,11 @@ class Qwen35MoEEngine(MoEEngine):
         decay = -self.w(p + ".A_log").float().exp() * F.softplus(a.float() + self.w(p + ".dt_bias"))
         out = self.gated_delta_rule(q, k, v, decay, beta, layer).to(x.dtype)
 
-        # Gated RMSNorm per head: norm(out) * w * silu(z)
+        # Gated RMSNorm per head: norm(out) * w * gate(z)
         o32 = out.float()
         o32 = o32 * torch.rsqrt(o32.pow(2).mean(-1, keepdim=True) + self.eps)
-        out = (self.w(p + ".norm.weight") * o32.to(out.dtype) * F.silu(z.float())).to(out.dtype)
+        gate = torch.sigmoid(z.float()) if self.gdn_output_gate == "sigmoid" else F.silu(z.float())
+        out = (self.w(p + ".norm.weight") * o32.to(out.dtype) * gate).to(out.dtype)
         return self.linear(out.reshape(seq_len, value_dim), p + ".out_proj")
 
     def gated_delta_rule(self, q, k, v, decay, beta, layer: int) -> torch.Tensor:
@@ -856,6 +644,13 @@ class Qwen35MoEEngine(MoEEngine):
         self.recurrent_state[layer] = state
         return torch.stack(outputs)
 
+
+class QwenChat:
+    """Qwen's chat format with <think> blocks (Qwen3.5/3.6/3.8), so `chat` and `web` work."""
+
+    chat = True
+    think = False
+
     def prompt_ids(self, prompt: str) -> list:
         # Qwen chat format; an empty think block turns thinking off. Mid-chat (position > 0), it first closes the
         # previous reply: continue_with stops on its end token without running it through the model.
@@ -863,164 +658,3 @@ class Qwen35MoEEngine(MoEEngine):
         text += f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
         text += "<think>\n" if self.think else "<think>\n\n</think>\n\n"
         return self.tokenizer.encode(text, add_special_tokens=False).ids
-
-class ReplyPrinter:
-    """Prints a reply to the terminal as it streams (an on_text callback). With thinking on, the reply starts inside
-    the <think> block the prompt opened: that part is printed dimmed, and the </think> tag is left out."""
-
-    DIM, PLAIN = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
-
-    def __init__(self, thinking: bool):
-        self.thinking = thinking
-        self.answer_started = False
-        if thinking:
-            print(self.DIM, end="")
-
-    def __call__(self, piece: str) -> bool:
-        if self.thinking:
-            thought, tag, piece = piece.partition("</think>")  # </think> is one token, so it arrives whole
-            print(thought, end="", flush=True)
-            if not tag:
-                return False
-            self.thinking = False
-            print(self.PLAIN + "\n", end="")
-        if not self.answer_started:  # the model puts blank lines after </think>
-            piece = piece.lstrip("\n")
-            self.answer_started = bool(piece)
-        print(piece, end="", flush=True)
-        return False
-
-    def finish(self):
-        """Ends the reply's line, and the dimming if it stopped mid-thought."""
-        print(self.PLAIN if self.thinking else "")
-        self.thinking = False
-
-ENGINES = {"qwen3_moe": MoEEngine, "qwen3_5_moe": Qwen35MoEEngine}
-
-def load_engine(model_dir: str, pack_dir: str = None, cache_gb: float = None) -> MoEEngine:
-    with open(os.path.join(model_dir, "config.json")) as f:
-        full_cfg = json.load(f)
-    model_type = full_cfg.get("model_type")
-    if model_type not in ENGINES:
-        raise NotImplementedError(f"model_type {model_type!r} is not supported (supported: {', '.join(ENGINES)})")
-    engine_class = ENGINES[model_type]
-    cfg = full_cfg.get("text_config", full_cfg)
-
-    eos = cfg.get("eos_token_id")
-    gen_cfg_path = os.path.join(model_dir, "generation_config.json")
-    if os.path.exists(gen_cfg_path):
-        with open(gen_cfg_path) as f:
-            eos = json.load(f).get("eos_token_id", eos)
-    eos_ids = set(eos if isinstance(eos, list) else [eos])
-
-    # Everything except the routed experts stays resident in RAM. get_tensor only memory-maps the shard,
-    # so clone() to really load it: otherwise macOS drops the pages under memory pressure and silently
-    # re-reads them from disk on every token. The one exception is the embedding table when lm_head is
-    # separate: each token reads a single row of it, so leaving it memory-mapped saves ~1 GB for free.
-    index_map = build_index_map(model_dir)
-    lazy = {engine_class.prefix + "embed_tokens.weight"} if "lm_head.weight" in index_map else set()
-    weights = {}
-    for shard in sorted(set(index_map.values())):
-        with safe_open(shard, framework="pt", device="cpu") as f:
-            for name in f.keys():
-                if not EXPERT_RE.match(name) and not name.startswith(SKIP_PREFIXES):
-                    tensor = f.get_tensor(name)
-                    weights[name] = tensor if name in lazy else tensor.clone()
-
-    # No cache by default: bf16 experts are big, and the OS file cache holds recent ones without the memory pressure
-    experts = ExpertStore(pack_dir or os.path.join(model_dir, "expert_pack"), int((cache_gb or 0) * 1024**3))
-    tokenizer = Tokenizer.from_file(os.path.join(model_dir, "tokenizer.json"))
-    return engine_class(cfg, eos_ids, weights, experts, tokenizer)
-
-def run_chat(model_dir: str, max_new_tokens: int = 2048, pack_dir: str = None, think: bool = False,
-             cache_gb: float = None, load=load_engine):
-    """An interactive chat (`main.py chat`). The model keeps the whole conversation in its caches, so each reply
-    only processes the new message. /reset starts a new conversation; /exit, Ctrl-D or Ctrl-C quits."""
-    engine = load(model_dir, pack_dir, cache_gb)
-    if not isinstance(engine, Qwen35MoEEngine):
-        raise SystemExit("chat needs a Qwen3.5/3.6 model (it uses their chat format)")
-    engine.think = think
-    print("\nchat: type a message and press Enter. /think turns thinking on or off, /reset starts over, "
-          "/exit (or Ctrl-D) quits.")
-    print(f"(thinking {'on' if think else 'off'})")
-    printer = None
-    try:
-        while True:
-            try:
-                message = input("\n> ").strip()
-            except EOFError:
-                break
-            if message == "/exit":
-                break
-            if message == "/reset":
-                engine.reset()
-                print("(new conversation)")
-                continue
-            if message == "/think":
-                engine.think = not engine.think
-                print(f"(thinking {'on' if engine.think else 'off'})")
-                continue
-            if not message:
-                continue
-            print()
-            printer = ReplyPrinter(engine.think)
-            engine.continue_with(engine.prompt_ids(message), max_new_tokens, on_text=printer)
-            printer.finish()
-            read, reply = engine.stats["prefill"], engine.stats["decode"]
-            speed = f" at {reply['tokens'] / reply['seconds']:.1f} tok/s" if reply["tokens"] else ""
-            print(f"\n[{reply['tokens']} tokens{speed}; read your message in {read['seconds']:.1f}s; "
-                  f"conversation so far: {engine.position} tokens]")
-    except KeyboardInterrupt:  # mid-reply, this leaves the caches half-updated, so it quits rather than continues
-        if printer:
-            printer.finish()
-        print()
-    finally:
-        engine.experts.save_usage()
-
-def run_prompt(model_dir: str, prompt: str, max_new_tokens: int = 2048, pack_dir: str = None,
-               think: bool = False, cache_gb: float = None, load=load_engine):
-    """Generates a reply to prompt, streaming it to stdout, then prints speed and I/O stats (`main.py run`).
-    load builds the engine from model_dir: load_engine here, gguf.engine.load_engine for .gguf files."""
-    start = time.perf_counter()
-    engine = load(model_dir, pack_dir, cache_gb)
-    load_seconds = time.perf_counter() - start
-    engine.think = think
-    if isinstance(engine, Qwen35MoEEngine):
-        print(f"> {prompt}\n")
-    else:
-        print(prompt, end="", flush=True)
-    printer = ReplyPrinter(think and isinstance(engine, Qwen35MoEEngine))
-    try:
-        engine.generate(prompt, max_new_tokens, on_text=printer)
-    finally:
-        printer.finish()
-    engine.experts.save_usage()
-
-    print(f"\n--- stats ---\nload:     {load_seconds:.1f}s")
-    for name, s in engine.stats.items():
-        if s["tokens"] == 0:
-            continue
-        gib = s["bytes_read"] / 1024**3
-        io_share = s["read_seconds"] / s["seconds"] * 100
-        io_speed = gib / s["read_seconds"] if s["read_seconds"] else 0
-        lookups = s["cache_hits"] + s["disk_reads"]
-        hit_rate = s["cache_hits"] / lookups * 100 if lookups else 0
-        print(f"{name + ':':9} {s['tokens']:4d} tokens in {s['seconds']:6.1f}s = {s['tokens'] / s['seconds']:6.2f} tok/s | "
-              f"cache hits {hit_rate:3.0f}% | {gib:6.2f} GiB read ({gib / s['tokens']:.2f} GiB/token) | "
-              f"disk {io_share:3.0f}% of time at {io_speed:.1f} GiB/s")
-        if s["prefetches"]:
-            print(f"{'':9} prefetch: {s['prefetches']} next-layer reads started, "
-                  f"{s['prefetch_used'] / s['prefetches'] * 100:.0f}% of them used")
-    cache = engine.experts
-    print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache.cache_bytes / 1024**3:.2f} GiB used, "
-          f"{len(cache.cache)} experts held")
-    if engine.experts_routed:
-        print(f"skipped:  {engine.experts_skipped} of {engine.experts_routed} routed experts while decoding "
-              f"({engine.experts_skipped / engine.experts_routed * 100:.0f}%), weight below {engine.min_expert_weight}")
-
-    decode = engine.stats.get("decode")
-    if decode and decode["tokens"]:
-        print("\ndecode time per token, by section:")
-        for section, seconds in sorted(decode["timings"].items(), key=lambda kv: -kv[1]):
-            ms = seconds / decode["tokens"] * 1000
-            print(f"  {section:18s} {ms:8.1f} ms  ({seconds / decode['seconds'] * 100:4.1f}%)")
