@@ -90,8 +90,9 @@ def fuse_gate_up(plan: dict, part_info: dict):
 def compile_pack(gguf_path: str, out_dir: str = None, gpu: bool = None):
     """Copies a GGUF model's expert tensors, still quantized, into experts.pack + manifest.json
     (default: <model>.expert_pack/ next to the .gguf file). gate and up are fused into one gate_up part, and
-    Q4_K and Q6_K parts are converted to int4, which runs without dequantizing (see quants.PACK_LAYOUTS);
-    other types are copied byte for byte. gpu stores the int4 parts in the GPU (MPS) kernel's format, so they
+    With gpu, every part is copied byte for byte: gguf/metal.py runs Q4_K, Q6_K and Qwen3.8's types (IQ4_XS,
+    IQ3_XXS, IQ2_S, IQ4_NL, Q5_0, Q2_0) as they are. Without it, those are converted to int4 for the CPU kernel
+    (see quants.PACK_LAYOUTS: Q4_K exactly, the rest requantized); other types are copied byte for byte. gpu stores the int4 parts in the GPU (MPS) kernel's format, so they
     run on the GPU (default: when torch can use MPS)."""
     import torch  # only GGUF packs need it (for the conversions)
     from .quants import PACK_LAYOUTS, PACK_LAYOUTS_GPU, int4_packable
@@ -100,7 +101,7 @@ def compile_pack(gguf_path: str, out_dir: str = None, gpu: bool = None):
         gpu = torch.backends.mps.is_available()
     elif gpu and not torch.backends.mps.is_available():
         raise ValueError("--gpu needs torch with MPS (Apple Silicon)")
-    print(f"int4 experts will run on the {'GPU' if gpu else 'CPU'}" + ("" if gpu else " (pack --gpu to run them on the GPU)"))
+    print(f"experts will run on the {'GPU' if gpu else 'CPU'}" + ("" if gpu else " (pack --gpu to run them on the GPU)"))
 
     out_dir = out_dir or default_pack_dir(gguf_path)
     os.makedirs(out_dir, exist_ok=True)
@@ -113,8 +114,9 @@ def compile_pack(gguf_path: str, out_dir: str = None, gpu: bool = None):
 
     converters, sizes = {}, {}
     for key, info in part_info.items():
-        if info["dtype"] in PACK_LAYOUTS and int4_packable(info["shape"], gpu):
-            layout, nbytes, convert = (PACK_LAYOUTS_GPU if gpu else PACK_LAYOUTS)[info["dtype"]]
+        layouts = PACK_LAYOUTS_GPU if gpu else PACK_LAYOUTS
+        if info["dtype"] in layouts and int4_packable(info["shape"], gpu):
+            layout, nbytes, convert = layouts[info["dtype"]]
             converters[key] = functools.partial(convert, shape=tuple(info["shape"]))
             sizes[key] = nbytes(info["shape"])
             part_info[key] = {"shape": info["shape"], "dtype": layout, "source_dtype": info["dtype"]}

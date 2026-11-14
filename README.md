@@ -111,7 +111,7 @@ Decoding is greedy: it always picks the most likely next token.
 | Option | Default | What it does |
 |---|---|---|
 | `--out-dir DIR` | `<name>.expert_pack` | Where to write the pack. |
-| `--gpu` / `--no-gpu` | on when PyTorch can use MPS | Store the 4-bit experts so they run on the GPU. `--no-gpu` keeps them on the CPU. |
+| `--gpu` / `--no-gpu` | on when PyTorch can use MPS | Keep the experts in their GGUF formats, which run on the GPU. `--no-gpu` converts them to 4 bits for the CPU. |
 
 ## How it works
 
@@ -126,10 +126,10 @@ Most of the time is still spent reading experts from the SSD.
 
 The embedding table stays quantized, and rows are dequantized as they're looked up. The other non-expert weights are dequantized when the model loads: to bf16 for Qwen3.6, and to int8 with one scale per row for Qwen3.8 (half the memory, and torch's int8 matrix multiply is faster than bf16 on Apple Silicon). `--backbone int8` or `--backbone bf16` overrides the default.
 
-The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so `pack` stores Q4_K_M's two types in layouts that are cheap to run:
+The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so they're computed straight from their quantized form:
 
-- **Q4_K** is stored in PyTorch's own 4-bit format. Each matrix multiply runs straight on the 4-bit weights, so these experts are never dequantized.
-- **Q6_K** is requantized to the same 4-bit format when packing. It loses some of Q6_K's precision, but every expert then runs on the 4-bit kernel and is read straight into its cache slot. Packs built earlier stored Q6_K as int8; they still run, but print a note asking you to rebuild.
+- **On the GPU** (the default), every expert stays exactly as the GGUF stores it, and willow's own Metal kernels (`gguf/metal.py`, compiled when first used) compute straight from those bytes. They cover Q4_K and Q6_K (Qwen3.6's Q4_K_M) and Qwen3.8's IQ4_XS, IQ3_XXS, IQ2_S, IQ4_NL, Q5_0 and Q2_0. The experts are exactly the published weights, and the pack is as small as the GGUF's experts (18.2 GiB for Qwen3.6, 56.4 GiB for Qwen3.8). On one token's experts the kernels are as fast as PyTorch's 4-bit kernel for Qwen3.6 (8.8 against 9.1 ms) and faster for Qwen3.8 (about 15 against 23 ms).
+- **On the CPU** (`pack --no-gpu`), experts are converted to PyTorch's CPU 4-bit format, which multiplies straight from the 4-bit weights. Q4_K converts exactly; Q6_K and Qwen3.8's types are requantized, which adds some error (0.7–7.5% for Qwen3.8's). Packs built earlier (4-bit for the GPU, or Q6_K as int8) still run; the int8 ones print a note asking you to rebuild.
 
 Each expert's gate and up matrices are also fused into one, so computing an expert takes two matrix multiplies instead of three.
 
@@ -137,7 +137,7 @@ The 4-bit formats come from private PyTorch functions, so a pack records the PyT
 
 ### On the GPU
 
-By default (when PyTorch can use Apple's GPU through MPS), `pack` stores the 4-bit experts in the layout of PyTorch's GPU 4-bit kernel, and `run` computes them on the GPU. The expert cache is memory the CPU and GPU share (Apple Silicon has one pool of RAM for both), so each expert is read from the SSD straight into memory the GPU computes from, with no extra copy. Even with `--cache-gb 0`, there are 64 such slots (about 120 MiB) to read into.
+By default (when PyTorch can use Apple's GPU through MPS), `pack` keeps the experts in their GGUF formats and `run` computes them on the GPU with willow's Metal kernels. The expert cache is memory the CPU and GPU share (Apple Silicon has one pool of RAM for both), so each expert is read from the SSD straight into memory the GPU computes from, with no extra copy. Even with `--cache-gb 0`, each expert size gets 32 such slots to read into (Qwen3.8's experts come in six sizes, so 0.41 GiB).
 
 The rest of the model runs on the GPU too, so the hidden state stays there. The non-expert weights are moved to GPU memory when the model loads (their CPU copies are freed, so it costs no extra RAM). On the GPU, every small operation costs about the same to issue however little work it does, and each layer has about a hundred of them, so while decoding the small steps are compiled with `torch.compile`, which fuses them into a few GPU kernels. That compile takes about a second on the first generated token, less on later runs (PyTorch caches it on disk). The KV cache grows in blocks of 256 positions, because each new tensor shape costs a fresh GPU setup. Each layer waits for the GPU once, to bring back which experts its tokens picked (and the guesses for the next layer), which the CPU needs to read them.
 
@@ -153,7 +153,7 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 These load, but haven't been tested the way the Q4_K_M file above has:
 
-- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 (Qwen3.8's types) are requantized to the 4-bit format when packing, with a per-group search that keeps the added error low (see ROADMAP.md). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 (Qwen3.8's types) run as they are on the GPU (see above). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
 willow only runs GGUF files. The original bf16 safetensors path has been removed; see [ROADMAP.md](ROADMAP.md) for what's coming next.
 
@@ -162,7 +162,7 @@ willow only runs GGUF files. The original bf16 safetensors path has been removed
 - `main.py`: the command line.
 - `model_list.py`: reads `models.json` and turns a model's name into its path and settings.
 - `runner.py`: the terminal side of `run` and `chat`: streaming the reply and printing the stats.
-- `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization (with the IQ grids in `iq_grids.py`), the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`); and tables read row by row from the GGUF instead of loaded (`streamed.py`).
+- `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization (with the IQ grids in `iq_grids.py`), the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); Metal kernels that run Qwen3.8's ggml types as they are (`metal.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`); and tables read row by row from the GGUF instead of loaded (`streamed.py`).
 - `engines/`: one package per model family, picked by the GGUF's `general.architecture` (`engines/__init__.py`). `engines/base.py` holds what they share: the expert streaming, attention and KV cache, the Gated DeltaNet layers, Qwen's chat format and the generate loop.
   - `engines/qwen36/`: Qwen3.6 (and Qwen3.5 and Qwen3-MoE). How their layers are wired (`model.py`) and its GGUF loader (`loader.py`), which renames the GGUF tensors to their Hugging Face names and undoes llama.cpp's conversion changes.
 - `web/`: the chat page for `main.py web`: the page (`index.html`) and its server (`server.py`). Replies are rendered as Markdown with [marked](https://github.com/markedjs/marked) 16.4.2, kept in `web/vendor/` (MIT license, `marked-LICENSE.md`) so the page works offline.
