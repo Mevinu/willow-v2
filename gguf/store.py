@@ -21,7 +21,8 @@ from .quants import (INT4_LAYOUTS, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, d
 USAGE_FILE = "expert_usage.json"  # the expert usage table, next to manifest.json in the pack
 SLAB_CHUNK_BYTES = 1024**3  # largest single buffer a slab is allocated as
 GPU_SLAB_MIN = 64           # slots a GPU pack reads into when the cache is off or smaller
-PRELOAD_FRACTION = 0.15  # share of each layer's experts, most used first, read into the cache at load
+PRELOAD_FRACTION = 0.15  # share of each layer's experts, most used first, read into the cache at load (plain LRU)
+HOT_SHARE = 0.75  # share of a slab's slots kept for the hot set: the most used experts, by the usage table
 
 def expert_weights(parts: dict) -> tuple:
     """An expert's parts by name -> (gate_up, down) when gate and up are fused into one
@@ -36,8 +37,13 @@ class ExpertStore:
     requests in flight and later reads finish while earlier experts are being computed. INT4_G32 parts stay 4-bit
     (Int4Weight); the rest are dequantized to bf16 on the read threads.
 
-    With cache_bytes, recently used experts are kept in a slab: memory allocated once and cut into fixed slots, one
-    expert each, evicted least recently used first. Its size is exact (the weights live in the slots, and nothing
+    With cache_bytes, experts are kept in a slab: memory allocated once and cut into fixed slots, one expert each.
+    Up to HOT_SHARE of the slots hold the hot set, the most used experts by the usage table (across all layers,
+    so a layer whose routing is more concentrated gets more of them); preload reads them in. Every other read
+    (misses, prefetches) goes into the rest of the slots, which are reused least recently used first; a hot
+    expert is only evicted when none of those can be. Plain LRU over every slot doesn't work when a token reads
+    more experts than the cache holds (Qwen3.8: ~500 per token): each token would evict the whole cache, the
+    most used experts included, before anything is reused. Its size is exact (the weights live in the slots, and nothing
     else is kept alive), and the OS file cache is turned off for the pack so the same bytes aren't held twice.
     Layers whose slots are the same size share a slab, with the same number of slots per layer. A slot holds the
     expert as it is computed with: int4 parts as stored, everything else as bf16, so a hit costs nothing. Layers
@@ -103,9 +109,12 @@ class ExpertStore:
         self.requested_cache = cache_bytes
         self.in_use = set()  # (layer, expert) the GPU may still be computing with (GPU slabs only)
         self.slabs = {}  # layer -> its slab group (shared by layers with the same slot layout)
+        self.hot = set()  # (layer, expert) the slabs keep for as long as they can (see choose_hot)
         if cache_bytes or self.gpu:
             self.build_slabs(cache_bytes)
         self.load_usage(pack_dir)
+        if self.slabs:
+            self.choose_hot()
 
     # Loading a layer's experts
 
@@ -204,7 +213,8 @@ class ExpertStore:
         weights = self.cache.get(key)
         if weights is not None:
             if self.slabs:
-                self.slabs[key[0]]["lru"].move_to_end(key)
+                group = self.slabs[key[0]]
+                (group["hot_lru"] if key in group["hot_lru"] else group["lru"]).move_to_end(key)
             else:
                 self.cache.move_to_end(key)
             self.hits += 1
@@ -230,7 +240,7 @@ class ExpertStore:
             group = self.slabs[key[0]]
             if weights is None:  # a GPU slot: its views are made here, on the main thread
                 weights = self.gpu_slot_weights(group, slot, key[0])
-            group["lru"][key] = slot
+            (group["hot_lru"] if key in self.hot else group["lru"])[key] = slot
             self.cache[key] = weights
             self.cached_bytes += group["slot"]
         return weights
@@ -288,7 +298,8 @@ class ExpertStore:
                 chunks.append(shared_empty(size)[::-1] if self.gpu else (mmap.mmap(-1, size), None))
             group = {"chunks": chunks,  # (CPU-writable buffer, the same bytes as a GPU tensor or None)
                      "per_chunk": per_chunk, "slot": slot, "free": list(range(count)),
-                     "lru": OrderedDict()}  # lru: (layer, expert) -> slot number, least recently used first
+                     # (layer, expert) -> slot number, least recently used first: hot experts, and the rest
+                     "hot_lru": OrderedDict(), "lru": OrderedDict(), "layers": layers}
             for layer in layers:
                 self.slabs[layer] = group
         if sys.platform == "darwin":
@@ -301,12 +312,13 @@ class ExpertStore:
         so they are never taken."""
         if group["free"]:
             return group["free"].pop()
-        victim = next((key for key in group["lru"] if key not in self.busy and key not in self.in_use), None)
-        if victim is None:
-            return None
-        del self.cache[victim]
-        self.cached_bytes -= group["slot"]
-        return group["lru"].pop(victim)
+        for lru in (group["lru"], group["hot_lru"]):  # hot experts only when nothing else can go
+            victim = next((key for key in lru if key not in self.busy and key not in self.in_use), None)
+            if victim is not None:
+                del self.cache[victim]
+                self.cached_bytes -= group["slot"]
+                return lru.pop(victim)
+        return None
 
     def slot_place(self, group: dict, slot: int):
         """(CPU buffer, GPU tensor or None, offset of the slot in them)."""
@@ -410,6 +422,24 @@ class ExpertStore:
             return
         self.usage, self.usage_runs = counts, saved.get("runs", 0)
 
+    def choose_hot(self):
+        """Picks the hot set: in each slab group, its HOT_SHARE of slots (leaving at least GPU_SLAB_MIN for other
+        reads) go to the experts its layers have been routed to most, by the usage table."""
+        self.hot = set()
+        if not self.usage_runs:
+            return
+        for group in {id(g): g for g in self.slabs.values()}.values():
+            slots = len(group["free"]) + len(group["lru"]) + len(group["hot_lru"])
+            room = min(int(slots * HOT_SHARE), slots - GPU_SLAB_MIN)
+            if room <= 0:
+                continue
+            layers = group["layers"]
+            counts = self.usage[layers].flatten()
+            top = counts.topk(min(room, counts.numel()))
+            num_experts = self.usage.shape[1]
+            self.hot.update((layers[i // num_experts], i % num_experts)
+                            for i, used in zip(top.indices.tolist(), top.values.tolist()) if used)
+
     def record_usage(self, layer: int, selected: torch.Tensor):
         """Called by the engine with the experts each token was routed to."""
         self.usage[layer] += torch.bincount(selected.flatten(), minlength=self.usage.shape[1])
@@ -428,27 +458,28 @@ class ExpertStore:
         return list(zip(order.tolist(), counts.tolist()))[:n]
 
     def preload(self, fraction: float = PRELOAD_FRACTION):
-        """Reads each layer's most used experts (by the usage table) into the cache before generating, so they
-        start as hits. At most fraction of a layer's experts, only ones that have been used, and no more than
-        the layer's share of the cache. Each layer's least used preload goes in first, so it is evicted first."""
+        """Reads the most used experts (by the usage table) into the cache before generating, so they start as
+        hits. With slabs, that's the hot set (see choose_hot). Otherwise (the plain LRU), each layer's most used, at
+        most fraction of its experts, only ones that have been used, and no more than the layer's share of the
+        cache; each layer's least used goes in first, so it is evicted first."""
         if not self.usage_runs or not fraction:
             return
         if not self.requested_cache:
             print("note: expert cache is off (--cache-gb 0), so the most used experts aren't preloaded")
             return
         start = time.perf_counter()
-        count = int(self.usage.shape[1] * fraction)
+        reads = deque()
         if self.slabs:
-            count = min(count, self.slots_per_layer)
+            for key in sorted(self.hot):  # in pack order, so the SSD reads mostly forward
+                reads.append((key, *self.start_read(*key)))
         else:  # the plain LRU: fit every layer's share, by its largest expert
             layer_bytes = sum(max(self.manifest["experts"][f"{layer}_{e}"]["read_length"]
                                   for e in range(self.usage.shape[1])) for layer in range(self.usage.shape[0]))
-            count = min(count, self.cache_bytes // layer_bytes)
-        reads = deque()
-        for layer in range(self.usage.shape[0]):
-            for expert, used in reversed(self.most_used(layer, count)):
-                if used:
-                    reads.append(((layer, expert), *self.start_read(layer, expert)))
+            count = min(int(self.usage.shape[1] * fraction), self.cache_bytes // layer_bytes)
+            for layer in range(self.usage.shape[0]):
+                for expert, used in reversed(self.most_used(layer, count)):
+                    if used:
+                        reads.append(((layer, expert), *self.start_read(layer, expert)))
         loaded = len(reads)
         while reads:  # popped as they are used, so read blocks aren't kept alive by their futures
             key, future, token = reads.popleft()
@@ -457,8 +488,9 @@ class ExpertStore:
                 if isinstance(w, Int4Weight):
                     w.to_gpu()
         release_staged()
-        print(f"preloaded {loaded} most used experts ({self.cached_bytes / 1024**3:.2f} GiB, up to "
-              f"{count} per layer) in {time.perf_counter() - start:.1f}s")
+        where = "as the hot set" if self.slabs else f"up to {count} per layer"
+        print(f"preloaded {loaded} most used experts ({self.cached_bytes / 1024**3:.2f} GiB, {where}) in "
+              f"{time.perf_counter() - start:.1f}s")
 
     def close(self):
         self.pool.shutdown()
