@@ -15,13 +15,18 @@ from itertools import islice
 import torch
 
 from .compiler import PAGE_ALIGNMENT, align_up
+from . import metal
+from .metal import GGMLWeight
 from .quants import (INT4_LAYOUTS, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, dequantize, int4_nbytes,
                      release_staged)
 
 USAGE_FILE = "expert_usage.json"  # the expert usage table, next to manifest.json in the pack
 SLAB_CHUNK_BYTES = 1024**3  # largest single buffer a slab is allocated as
-GPU_SLAB_MIN = 64           # slots a GPU pack reads into when the cache is off or smaller
-PRELOAD_FRACTION = 0.15  # share of each layer's experts, most used first, read into the cache at load (plain LRU)
+# Slots every slab group has at least on the GPU, whatever --cache-gb says: reads need somewhere to land (one
+# layer's misses plus the next layer's prefetches). Per group, since layers whose experts differ in size (Qwen3.8's
+# GGUF formats: six sizes) get separate groups
+GPU_SLAB_MIN = 32
+PRELOAD_FRACTION = 0.03  # share of each layer's experts, most used first, read into the cache at load (plain LRU)
 HOT_SHARE = 0.75  # share of a slab's slots kept for the hot set: the most used experts, by the usage table
 
 def expert_weights(parts: dict) -> tuple:
@@ -51,7 +56,8 @@ class ExpertStore:
     Only the main thread changes the cache; a read thread just fills the one slot it was given. If the slabs can't
     be built (cache too small), a plain LRU of up to cache_bytes is used instead.
 
-    A pack built with `pack --gpu` (INT4_G32_GPU parts) computes its experts on the GPU. Its slabs are memory the
+    A pack built with `pack --gpu` (INT4_G32_GPU parts, or ggml types gguf/metal.py runs, kept as they are)
+    computes its experts on the GPU. Its slabs are memory the
     CPU and GPU share (see mps_shared), so an expert is read from the SSD straight into memory the GPU computes
     from, with no copy. They always exist (with --cache-gb 0, just enough slots to read into, in GPU_SLAB_MIN), and
     the GPU runs behind the CPU, so a slot handed out for the current layer isn't refilled until load_many starts
@@ -96,13 +102,16 @@ class ExpertStore:
         if types & INT4_LAYOUTS and self.manifest.get("torch_version") != torch.__version__:
             raise ValueError(f"{pack_dir} was built with torch {self.manifest.get('torch_version')}, and its int4 "
                              f"layout may not match torch {torch.__version__}; rerun `main.py pack` on this model")
-        if types & set(PACK_LAYOUTS):
-            print(f"note: {pack_dir} stores {', '.join(sorted(types & set(PACK_LAYOUTS)))} experts as raw ggml "
-                  "blocks, which are slow to dequantize; rerun `main.py pack` on this model to convert them")
+        # ggml types the GPU runs as they are (gguf/metal.py), when there is one
+        self.metal_types = set(metal.TYPES) if metal.available() else set()
+        slow = (types & set(PACK_LAYOUTS)) - self.metal_types
+        if slow:
+            print(f"note: {pack_dir} stores {', '.join(sorted(slow))} experts as raw ggml blocks, which are slow to "
+                  "dequantize on the CPU; rerun `main.py pack` on this model to convert them")
         if "INT8_G16" in types:
             print(f"note: {pack_dir} stores Q6_K experts as int8, which is dequantized as each expert is read; rerun "
                   "`main.py pack` on this model to store them as int4 (smaller, and run without dequantizing)")
-        self.gpu = "INT4_G32_GPU" in types
+        self.gpu = "INT4_G32_GPU" in types or bool(types & self.metal_types)
         if self.gpu and not torch.backends.mps.is_available():
             raise ValueError(f"{pack_dir} was packed for the GPU (`pack --gpu`), but torch can't use MPS here; "
                              "rerun `main.py pack --no-gpu` on this model")
@@ -267,10 +276,10 @@ class ExpertStore:
             parts, offset = {}, 0
             for name in entries[0]["parts"]:
                 shape, type_name = self.parts[f"{layer}.{name}"]
-                size = int4_nbytes(shape) if type_name in INT4_LAYOUTS else math.prod(shape) * 2
+                size = self.stored_size(shape, type_name) if self.as_is(type_name) else math.prod(shape) * 2
                 parts[name] = (offset, size)
                 offset += size
-            direct = all(self.parts[f"{layer}.{name}"][1] in INT4_LAYOUTS for name in parts)
+            direct = all(self.as_is(self.parts[f"{layer}.{name}"][1]) for name in parts)
             if direct:
                 assert all(e["parts"][n]["offset"] == parts[n][0] for e in entries for n in parts)
                 offset = max(e["read_length"] for e in entries)
@@ -279,17 +288,15 @@ class ExpertStore:
 
         per_layer = cache_bytes // sum(slot * len(layers) for (_, slot), layers in layouts.items())
         fewest_layers = min(len(layers) for layers in layouts.values())
-        if per_layer * fewest_layers < 2 * self.read_ahead:
-            if not self.gpu:
-                print("note: --cache-gb is too small to be useful; cache off")
-                self.cache_bytes = 0
-                return
-            per_layer = max(per_layer, -(-GPU_SLAB_MIN // fewest_layers))
+        if per_layer * fewest_layers < 2 * self.read_ahead and not self.gpu:
+            print("note: --cache-gb is too small to be useful; cache off")
+            self.cache_bytes = 0
+            return
         self.slots_per_layer = per_layer
         if self.gpu:
             from .mps_shared import shared_empty
         for (_, slot), layers in layouts.items():
-            count = per_layer * len(layers)
+            count = max(per_layer * len(layers), GPU_SLAB_MIN if self.gpu else 0)
             # A slab is cut into chunks of whole slots (Metal limits the size of one buffer)
             per_chunk = max(1, min(count, SLAB_CHUNK_BYTES // slot))
             chunks = []
@@ -305,6 +312,15 @@ class ExpertStore:
         if sys.platform == "darwin":
             fcntl.fcntl(self.fd, getattr(fcntl, "F_NOCACHE", 48), 1)
         self.cache_bytes = sum(g["slot"] * len(g["free"]) for g in {id(g): g for g in self.slabs.values()}.values())
+
+    def as_is(self, type_name: str) -> bool:
+        """Whether a part is computed with exactly the bytes the pack stores (int4, or a ggml type the GPU runs),
+        so it can be read straight into its slot."""
+        return type_name in INT4_LAYOUTS or type_name in self.metal_types
+
+    @staticmethod
+    def stored_size(shape: tuple, type_name: str) -> int:
+        return int4_nbytes(shape) if type_name in INT4_LAYOUTS else shape[0] * metal.row_bytes(type_name, shape[1])
 
     def take_slot(self, group: dict):
         """A free slot, else the least recently used one not handed out by load_many, nor (GPU slabs) used since
@@ -332,8 +348,12 @@ class ExpertStore:
         for name, (offset, size) in self.slot_parts[layer].items():
             shape, type_name = self.parts[f"{layer}.{name}"]
             raw = gpu[base + offset:base + offset + size]
-            parts[name] = (Int4Weight.from_gpu_bytes(raw, shape) if type_name in INT4_LAYOUTS
-                           else raw.view(torch.bfloat16).view(shape))
+            if type_name in INT4_LAYOUTS:
+                parts[name] = Int4Weight.from_gpu_bytes(raw, shape)
+            elif type_name in self.metal_types:
+                parts[name] = GGMLWeight(raw, type_name, shape)
+            else:
+                parts[name] = raw.view(torch.bfloat16).view(shape)
         return expert_weights(parts)
 
     def slot_tensor(self, slab: mmap.mmap, base: int, layer: int, name: str):
@@ -365,7 +385,7 @@ class ExpertStore:
                 self.pread(block, layer, expert, entry)
                 for name, part in entry["parts"].items():
                     offset, size = self.slot_parts[layer][name]
-                    if self.parts[f"{layer}.{name}"][1] in INT4_LAYOUTS:
+                    if self.as_is(self.parts[f"{layer}.{name}"][1]):
                         view[base + offset:base + offset + size] = memoryview(block)[part["offset"]:part["offset"] + size]
                     else:
                         self.slot_tensor(slab, base, layer, name).copy_(self.part_tensor(block, layer, name, part))
@@ -393,14 +413,16 @@ class ExpertStore:
             self.bytes_read += len(buf)
 
     def part_tensor(self, block: bytearray, layer: int, name: str, part: dict):
-        """Turns one part's bytes inside a read block into a weight: int4 parts view the block, others are
-        dequantized to bf16."""
+        """Turns one part's bytes inside a read block into a weight: int4 parts and ggml types the GPU runs view the
+        block (copied to the GPU when first used), others are dequantized to bf16."""
         shape, type_name = self.parts[f"{layer}.{name}"]
         if type_name in INT4_LAYOUTS:
             return Int4Weight.from_buffer(block, part["offset"], shape, gpu=type_name == "INT4_G32_GPU")
         if type_name == "INT8_G16":
             return dequant_int8_g16(block, part["offset"], shape)
         raw = torch.frombuffer(block, dtype=torch.uint8, count=part["size"], offset=part["offset"])
+        if type_name in self.metal_types:
+            return GGMLWeight(raw, type_name, shape)
         return dequantize(raw, type_name, shape)
 
     # Expert usage table: how many tokens each (layer, expert) has been routed to, summed over every run on this

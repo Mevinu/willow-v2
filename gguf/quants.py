@@ -349,13 +349,14 @@ def int8_nbytes(shape: tuple) -> int:
 
 # ggml type -> (pack layout, its size for a [rows, k] part, converter from the ggml bytes)
 PACK_LAYOUTS = {"Q4_K": ("INT4_G32", int4_nbytes, q4_k_to_int4), "Q6_K": ("INT4_G32", int4_nbytes, q6_k_to_int4)}
-PACK_LAYOUTS_GPU = {"Q4_K": ("INT4_G32_GPU", int4_nbytes, functools.partial(q4_k_to_int4, gpu=True)),
-                    "Q6_K": ("INT4_G32_GPU", int4_nbytes, functools.partial(q6_k_to_int4, gpu=True))}
-# Qwen3.8-Flash-Next's expert types (Unsloth's UD quants), requantized with the per-group search
+# A GPU pack converts nothing: gguf/metal.py runs every expert type a GGUF of these models uses (Q4_K, Q6_K and
+# Qwen3.8's types) exactly as stored. On one token's experts it's as fast as the int4 kernel (Qwen3.6) or faster
+# (Qwen3.8), and the pack is smaller. INT4_G32_GPU packs built before that still run (Int4Weight with gpu=True).
+PACK_LAYOUTS_GPU = {}
+# Qwen3.8-Flash-Next's expert types (Unsloth's UD quants). A CPU pack has no kernels for them, so they're requantized
+# with the per-group search
 for _type in ("Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ2_S", "Q2_0"):
     PACK_LAYOUTS[_type] = ("INT4_G32", int4_nbytes, functools.partial(requantize_to_int4, type_name=_type))
-    PACK_LAYOUTS_GPU[_type] = ("INT4_G32_GPU", int4_nbytes,
-                               functools.partial(requantize_to_int4, type_name=_type, gpu=True))
 INT4_LAYOUTS = {"INT4_G32", "INT4_G32_GPU"}
 INT4_ROW_MULTIPLE = 16  # torch's int4 packing needs the row count to be a multiple of 16
 

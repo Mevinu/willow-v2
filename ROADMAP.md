@@ -60,7 +60,10 @@ Sizes on disk: experts 56.2 GiB, the PLE table 26.8 GiB, everything else 4.2 GiB
 - [x] Dequantizers for IQ4_XS, IQ3_XXS and IQ2_S in `quants.py`, with ggml's grids in `gguf/iq_grids.py`. All of them, IQ4_NL included, match gguf-py exactly on real blocks of this model's tensors, so every type in the GGUF now dequantizes.
 - [x] `QuantizedEmbedding` for IQ4_XS, so `token_embd` stays quantized (it works for any type with a dequantizer).
 - [x] A pack layout for IQ experts: (a) requantizing to INT4_G32 (or INT4_G32_GPU) at pack time, so they run on the int4 kernels. The other options were (b) keeping the IQ bytes and dequantizing on every read (slow), and (c) a Metal kernel that runs IQ blocks directly (the most work). Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 are dequantized, then requantized. For each group of 32 values, a search picks whichever range (min..max, shrunk by up to 20%, or the values' own even grid) gives the least error. Against the GGUF's weights this adds 0.7% (Q2_0), 4.3% (IQ3_XXS), 6.8% (IQ2_S) and 7.2–7.6% (IQ4_XS, IQ4_NL, Q5_0) relative error; plain min..max would give 2.4–8.4%. Every expert becomes 2.93 MiB, so the pack is about 70.5 GiB (up from 56.4), and a cold token reads about 1.4 GiB.
-- [ ] If the 7% shows in the output: an exact GPU path for the 4-bit IQ types (a 16-entry lookup table times the block scale, then a bf16 matmul), or keeping Q5_0 at 8 bits.
+- [x] The exact path, option (c): Metal kernels (`gguf/metal.py`, compiled at runtime with `torch.mps.compile_shader`) that compute straight from ggml's blocks for Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0. A GPU pack now keeps those experts as they are (56.4 GiB instead of 70.5 GiB). Decoding uses a matrix-vector kernel (one SIMD group per row, up to 8 tokens, bf16 in and out); bigger batches are dequantized to bf16 on the GPU, then multiplied by torch. The dequantized weights match the CPU dequantizers (and so gguf-py) bit for bit on every type. On one token's 480 real experts, the kernels take 14.9 ms, against 23 ms for torch's int4 kernel. Requantizing to int4 remains for CPU packs (`pack --no-gpu`).
+- [ ] Faster kernels: the down matrices (k = 640) leave 12 of each SIMD group's 32 threads idle, and IQ4_XS is the slowest type.
+- [x] Q4_K and Q6_K kernels too, so Qwen3.6's GPU pack also keeps its experts as they are: 18.2 GiB instead of 18.8, Q6_K now exact, and as fast as int4 (8.8 against 9.1 ms per token of experts). These are also most of Qwen3.8's non-expert weights (Q6_K and Q8_0).
+- [ ] Non-expert weights in their GGUF formats on the GPU (needs a Q8_0 kernel): exact, and about 0.4 GiB less than int8. Check the speed against torch's int8 kernel first.
 - [ ] A GGUF-only regression check that replaces the deleted reference checks: a short prompt's logits and greedy reply saved as a golden file per model.
 
 ### 3. The `qwen4exp` engine (`engines/qwen38/`)
@@ -131,5 +134,5 @@ out    = v + silu(conv1d(rms_norm(v)))       # depthwise, kernel 4, dilation 3: 
 
 ## Open questions
 
-- Is IQ → int4 at pack time accurate enough? Q2_0 converts almost exactly, but IQ2_S (layers 8–10) and the 4-bit IQ types gain about 7% relative error (see step 2).
+- Settled for GPU packs: the experts now run in their GGUF formats, exactly. The int4 requantizing (about 7% relative error for most types) applies only to CPU packs.
 - Does llama.cpp's converter change anything else that needs undoing (V-head order in the GDN layers, `ssm_a` sign, conv shapes), as it does for Qwen3.6? Check against `qwen4exp.cpp`'s tensor shapes.
