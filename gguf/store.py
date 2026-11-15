@@ -21,7 +21,9 @@ from .quants import (INT4_LAYOUTS, PACK_LAYOUTS, Int4Weight, dequant_int8_g16, d
                      release_staged)
 
 USAGE_FILE = "expert_usage.json"  # the expert usage table, next to manifest.json in the pack
-SLAB_CHUNK_BYTES = 1024**3  # largest single buffer a slab is allocated as
+# Largest single buffer a slab is allocated as (Metal limits one buffer: 8.88 GiB on a 16 GB M5). Big enough that a
+# layer's experts are almost always in one buffer, which the batched decode kernels need (see metal.gemv_combine)
+SLAB_CHUNK_BYTES = 4 * 1024**3
 # Slots every slab group has at least on the GPU, whatever --cache-gb says: reads need somewhere to land (one
 # layer's misses plus the next layer's prefetches). Per group, since layers whose experts differ in size (Qwen3.8's
 # GGUF formats: six sizes) get separate groups
@@ -132,6 +134,12 @@ class ExpertStore:
         (gate_up, down) or (gate, up, down). The reads for misses are submitted before this returns (up to
         read_ahead of them; for a decode step, all), so the SSD works on them while the caller computes the
         cache hits, which come first. Misses then come in the order their reads finish."""
+        return (item for batch in self.load_batches(layer, experts) for item in batch)
+
+    def load_batches(self, layer: int, experts: list):
+        """Like load_many, but returns an iterator of lists of (expert, weights): first every cache hit, then each
+        group of reads that have finished by the time the caller asks for more, so it can compute each list with
+        one kernel launch (see metal.gemv_batch)."""
         if self.gpu:
             # The last layer's output has been copied back, so the GPU is done with its slots and copies
             release_staged()
@@ -167,22 +175,31 @@ class ExpertStore:
         return self.results(layer, keys, hits, reads, pending, start)
 
     def results(self, layer: int, keys: list, hits: list, reads: dict, pending, start):
+        """Yields lists of (expert, weights); an expert stays busy (not evictable) until its list has been used."""
         try:
-            for expert, weights in hits:
-                yield expert, weights
-                self.busy.discard((layer, expert))
+            if hits:
+                yield hits
+                self.busy.difference_update((layer, expert) for expert, _ in hits)
             while reads:
                 done, _ = wait(reads, return_when=FIRST_COMPLETED)
+                batch = []
                 for future in done:
                     expert, token = reads.pop(future)
-                    weights = self.finish_read((layer, expert), future.result(), token)
+                    batch.append((expert, self.finish_read((layer, expert), future.result(), token)))
                     following = next(pending, None)
                     if following is not None:
                         start(following)
-                    yield expert, weights
-                    self.busy.discard((layer, expert))
+                yield batch
+                self.busy.difference_update((layer, expert) for expert, _ in batch)
         finally:
             self.busy.difference_update(keys)
+
+    def runs_batched(self, layer: int) -> bool:
+        """Whether a layer's experts are fused gate_up and down, both of ggml types the GPU kernels run, so a decode
+        token's experts can be computed with the batched kernels (metal.gemv_batch, metal.gemv_combine)."""
+        names = ("gate_up", "down")
+        return (self.gpu and set(self.slot_parts.get(layer, ())) == set(names)
+                and all(self.parts[f"{layer}.{name}"][1] in self.metal_types for name in names))
 
     def prefetch(self, layer: int, experts: list):
         """Starts reading experts that will probably be needed soon, without waiting for them. load_many reuses

@@ -203,6 +203,69 @@ kernel void dequant_NAME(device bfloat* out [[buffer(0)]], device const uchar* w
 }
 """
 
+# One decode token's experts in a few launches instead of a few per expert (see Engine.batched_decode_experts).
+# Every expert's weight lives in the same buffer w (an expert slab), at its own byte offset. Per row, the math is
+# exactly gemv's for one token, so the results are bit-identical to running the experts one at a time.
+# - gemv_batch_<type>: y[positions[e]] = W_e x for every expert e (one SIMD group per (expert, row)).
+# - gemv_combine_<type>: y = the routing-weighted sum of W_e x_e over the experts, in their order, rounded to bf16
+#   at every step exactly as Engine.combine_decode_experts does with torch ops: p = bf16(W_e x_e),
+#   p * weight rounded to bf16, then added to the running bf16 total.
+BATCH_TEMPLATE = r"""
+kernel void gemv_batch_NAME(device bfloat* y [[buffer(0)]], device const uchar* w [[buffer(1)]],
+                            device const bfloat* x [[buffer(2)]], constant ulong* offsets [[buffer(3)]],
+                            constant ulong* positions [[buffer(4)]], constant uint& n_rows [[buffer(5)]],
+                            constant uint& k [[buffer(6)]], constant uint& row_bytes [[buffer(7)]],
+                            constant uint& n_experts [[buffer(8)]],
+                            uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+    LOAD_KV
+    uint group = gid / 32, e = group / n_rows, row = group % n_rows;
+    if (e >= n_experts) return;  // whole SIMD groups return together
+    device const uchar* r = w + offsets[e] + ulong(row) * row_bytes;
+    float acc = 0.0f;
+    float v[32];
+    for (uint c = lane; c < k / 32; c += 32) {
+        deq_NAME(r, c, v, kv);
+        device const bfloat* xt = x + c * 32;
+        float s = 0.0f;
+        for (int j = 0; j < 32; j++) s += v[j] * float(xt[j]);
+        acc += s;
+    }
+    float s = simd_sum(acc);
+    if (lane == 0) y[positions[e] * n_rows + row] = bfloat(s);
+}
+
+kernel void gemv_combine_NAME(device bfloat* y [[buffer(0)]], device const uchar* w [[buffer(1)]],
+                              device const bfloat* x [[buffer(2)]], constant ulong* offsets [[buffer(3)]],
+                              device const bfloat* weights [[buffer(4)]], constant ulong* perm [[buffer(5)]],
+                              constant uint& n_rows [[buffer(6)]], constant uint& k [[buffer(7)]],
+                              constant uint& row_bytes [[buffer(8)]], constant uint& n_experts [[buffer(9)]],
+                              uint gid [[thread_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+    LOAD_KV
+    uint row = gid / 32;
+    if (row >= n_rows) return;
+    bfloat total = bfloat(0.0f);
+    float v[32];
+    for (uint e = 0; e < n_experts; e++) {
+        device const uchar* r = w + offsets[e] + ulong(row) * row_bytes;
+        device const bfloat* xe = x + ulong(e) * k;
+        float acc = 0.0f;
+        for (uint c = lane; c < k / 32; c += 32) {
+            deq_NAME(r, c, v, kv);
+            device const bfloat* xt = xe + c * 32;
+            float s = 0.0f;
+            for (int j = 0; j < 32; j++) s += v[j] * float(xt[j]);
+            acc += s;
+        }
+        bfloat p = bfloat(simd_sum(acc));
+        bfloat scaled = bfloat(float(p) * float(weights[perm[e]]));
+        total = e == 0 ? scaled : bfloat(float(total) + float(scaled));
+    }
+    if (lane == 0) y[row] = total;
+}
+"""
+
 TYPES = ("Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ2_S", "Q2_0", "Q4_K", "Q6_K")  # the types these kernels run
 
 def _tables() -> str:
@@ -221,7 +284,8 @@ def _tables() -> str:
 def library():
     source = ("#include <metal_stdlib>\nusing namespace metal;\n"
               f"#define MAX_TOKENS {MAX_TOKENS}\n" + _tables() + DEQUANT_FUNCTIONS
-              + "".join(KERNEL_TEMPLATE.replace("NAME", name).replace("LOAD_KV", LOAD_KV) for name in TYPES))
+              + "".join((KERNEL_TEMPLATE + BATCH_TEMPLATE).replace("NAME", name).replace("LOAD_KV", LOAD_KV)
+                        for name in TYPES))
     return torch.mps.compile_shader(source)
 
 def available() -> bool:
@@ -238,6 +302,27 @@ def gemv(raw: torch.Tensor, type_name: str, shape: tuple, x: torch.Tensor) -> to
     y = torch.empty(x.shape[0], rows, dtype=torch.bfloat16, device=raw.device)
     getattr(library(), "gemv_" + type_name)(y, raw, x, rows, k, row_bytes(type_name, k), x.shape[0],
                                             threads=rows * 32, group_size=32 * ROWS_PER_GROUP)
+    return y
+
+def gemv_batch(base: torch.Tensor, type_name: str, shape: tuple, x: torch.Tensor, offsets: list, positions: list,
+               out: torch.Tensor):
+    """Several experts' weights, all [rows, k] of type_name at byte offsets in base (uint8, on the GPU), times one
+    token x (bf16 [1, k] or [k]): writes expert i's result to row positions[i] of out (bf16 [n, rows])."""
+    rows, k = shape
+    getattr(library(), "gemv_batch_" + type_name)(out, base, x, offsets, positions, rows, k, row_bytes(type_name, k),
+                                                  len(offsets), threads=len(offsets) * rows * 32,
+                                                  group_size=32 * ROWS_PER_GROUP)
+
+def gemv_combine(base: torch.Tensor, type_name: str, shape: tuple, x: torch.Tensor, offsets: list,
+                 weights: torch.Tensor, perm: list) -> torch.Tensor:
+    """sum over i of weights[perm[i]] * (W_i x[i]), in order of i, rounded to bf16 at each step like torch's bf16
+    ops. W_i: [rows, k] of type_name at byte offsets[i] in base; x: bf16 [n, k]; weights: bf16 [top_k], on the GPU.
+    -> bf16 [1, rows]."""
+    rows, k = shape
+    y = torch.empty(1, rows, dtype=torch.bfloat16, device=base.device)
+    getattr(library(), "gemv_combine_" + type_name)(y, base, x, offsets, weights, perm, rows, k,
+                                                    row_bytes(type_name, k), len(offsets), threads=rows * 32,
+                                                    group_size=32 * ROWS_PER_GROUP)
     return y
 
 def dequantize_gpu(raw: torch.Tensor, type_name: str, shape: tuple) -> torch.Tensor:
@@ -275,6 +360,14 @@ class GGMLWeight:
         quants._staged.append((self.raw,))
         quants._staged_bytes += self.nbytes
         self.raw = self.raw.to(self.device, non_blocking=True)
+
+    def location(self):
+        """(the GPU buffer holding this weight's bytes, as a uint8 tensor; their byte offset in it), for the
+        batched kernels. For an expert slot that's its slab chunk; a weight read outside the slabs is copied to the
+        GPU first and is its own buffer."""
+        self.to_gpu()
+        base = self.raw if self.raw._base is None else self.raw._base
+        return base, self.raw.storage_offset() - base.storage_offset()
 
     def linear(self, x: torch.Tensor) -> torch.Tensor:
         self.to_gpu()

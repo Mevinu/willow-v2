@@ -2,6 +2,7 @@
 which several Qwen models share (GatedDeltaNet, QwenChat). Weights use Hugging Face names; each model's loader maps
 the GGUF's names to them. The routed experts are streamed from the expert pack by gguf.store.ExpertStore."""
 import math
+import os
 import time
 from collections import defaultdict
 
@@ -9,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from tokenizers import Tokenizer
 
+from gguf import metal
 from gguf.store import ExpertStore
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -199,6 +201,10 @@ class Engine:
         self.min_expert_weight = 0.0  # skip routed experts below this routing weight (0: off; see skip_small_experts)
         self.experts_routed = self.experts_skipped = 0  # while decoding, when skipping is on
         self.keep_alive = []       # CPU sources of non-blocking GPU copies, kept until the GPU has run them
+        # A decode token's experts run in a few batched kernel launches per layer (see batched_decode_experts);
+        # WILLOW_BATCHED_EXPERTS=0 runs them one at a time instead, for comparison
+        self.batched_experts = os.environ.get("WILLOW_BATCHED_EXPERTS", "1") != "0"
+        self.gpu_event = torch.mps.Event() if self.device.type == "mps" else None  # see batched_decode_experts
         if self.device.type != "cpu":
             moved = {}  # tied tensors (lm_head = embed_tokens) are moved once
             for name in list(weights):
@@ -398,12 +404,76 @@ class Engine:
             routing_weights, selected, guess = self.skip_small_experts(routing_weights, selected, guess)
         used = selected[selected >= 0]
         self.experts.record_usage(layer, used)
+        experts = used.unique().tolist()  # sorted
+        fast_decode = self.ops.compiled and self.ops.decoding
+        batched = (fast_decode and self.batched_experts and x.shape[0] == 1 and x.dtype == torch.bfloat16
+                   and routing_weights.dtype == torch.bfloat16 and self.experts.runs_batched(layer))
         # Start this layer's reads first, so the guesses for the next layer queue up behind them
-        loads = self.experts.load_many(layer, used.unique().tolist())
+        loads = (self.experts.load_batches if batched else self.experts.load_many)(layer, experts)
         if guess is not None:
             self.experts.prefetch(layer + 1, guess)
         t = self.tick("read setup", t)
+        if batched:
+            out = self.batched_decode_experts(x, experts, loads, selected, routing_weights, t)
+        else:
+            out = self.each_expert(x, loads, selected, routing_weights, t)
 
+        sp = p + ".shared_expert"
+        if sp + ".gate_proj.weight" in self.weights:
+            t = time.perf_counter()
+            shared = (self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"), self.w(sp + ".down_proj.weight"),
+                      self.w(p + ".shared_expert_gate.weight"))
+            # Compiled only with plain tensors: torch.compile can't trace an Int8Weight (an int8 backbone)
+            run = self.ops.shared_expert if all(isinstance(w, torch.Tensor) for w in shared) else shared_expert
+            out = out + run(x, *shared)
+            self.tick("shared expert", t)
+        return out
+
+    def batched_decode_experts(self, x: torch.Tensor, experts: list, loads, selected: torch.Tensor,
+                               routing_weights: torch.Tensor, t: float) -> torch.Tensor:
+        """One decode token's routed experts in about three GPU launches instead of a few per expert, with the same
+        bf16 result as combine_decode_experts: gate_up for every expert in a batch at once (metal.gemv_batch; once
+        for the cache hits, then once per group of reads that finish together), the activation over all of them,
+        then down and the routing-weighted sum in one kernel (metal.gemv_combine). experts is sorted, and loads
+        is ExpertStore.load_batches' iterator for them."""
+        x = x.contiguous()  # the kernels index the raw buffers
+        position = {expert: i for i, expert in enumerate(experts)}
+        gate_up = None  # [experts, 2 * intermediate]: row i is expert experts[i]'s gate_up output
+        downs = {}      # expert -> its down weight
+        for batch in loads:
+            t = self.tick("expert load", t)
+            groups = {}  # GPU buffer -> (buffer, [byte offsets], [rows in gate_up]); usually one
+            for expert, (weight, down) in batch:
+                base, offset = weight.location()
+                group = groups.setdefault(base.data_ptr(), (base, [], []))
+                group[1].append(offset)
+                group[2].append(position[expert])
+                downs[expert] = down
+            if gate_up is None:
+                gate_up = torch.empty(len(experts), weight.shape[0], dtype=torch.bfloat16, device=x.device)
+            for base, offsets, rows in groups.values():
+                metal.gemv_batch(base, weight.type_name, weight.shape, x, offsets, rows, gate_up)
+            # torch holds custom kernels (and everything queued before them) until something waits for the GPU,
+            # so without this the GPU would sit idle while the next reads are awaited, then run the whole layer
+            # at the next wait. Recording an event sends the queue to the GPU without waiting (~8 us)
+            self.gpu_event.record()
+            t = self.tick("expert compute", t)
+        hidden = self.ops.expert_gate(gate_up).contiguous()  # [experts, intermediate]
+        down = downs[experts[0]]
+        located = [downs[expert].location() for expert in experts]
+        if all(base.data_ptr() == located[0][0].data_ptr() for base, _ in located):
+            slots = selected[0].tolist()  # where each expert's routing weight is
+            out = metal.gemv_combine(located[0][0], down.type_name, down.shape, hidden, [o for _, o in located],
+                                     routing_weights[0], [slots.index(expert) for expert in experts])
+        else:  # the experts' down weights are in different buffers: run them one at a time
+            outputs = {expert: F.linear(hidden[i:i + 1], downs[expert]) for i, expert in enumerate(experts)}
+            out = self.combine_decode_experts(outputs, selected, routing_weights)
+        self.tick("expert compute", t)
+        return out.view_as(x)
+
+    def each_expert(self, x: torch.Tensor, loads, selected: torch.Tensor, routing_weights: torch.Tensor,
+                    t: float) -> torch.Tensor:
+        """The routed experts one at a time, as loads (ExpertStore.load_many's iterator) hands them over."""
         # Run every token routed to each expert as it arrives (cache hits first, then reads as they finish).
         # "expert load" is only the time spent waiting for a read that hasn't finished yet.
         # An expert whose weights are all on the GPU (a pack built with --gpu) is computed there, and its
@@ -458,16 +528,6 @@ class Engine:
             for total in sums.values():
                 out += total.to(x.device)
         self.tick("expert compute", t)
-
-        sp = p + ".shared_expert"
-        if sp + ".gate_proj.weight" in self.weights:
-            t = time.perf_counter()
-            shared = (self.w(sp + ".gate_proj.weight"), self.w(sp + ".up_proj.weight"), self.w(sp + ".down_proj.weight"),
-                      self.w(p + ".shared_expert_gate.weight"))
-            # Compiled only with plain tensors: torch.compile can't trace an Int8Weight (an int8 backbone)
-            run = self.ops.shared_expert if all(isinstance(w, torch.Tensor) for w in shared) else shared_expert
-            out = out + run(x, *shared)
-            self.tick("shared expert", t)
         return out
 
     @torch.no_grad()
