@@ -20,6 +20,12 @@ while Ctrl-J, Alt+Enter or Shift+Enter (where the terminal tells it apart) start
 taller than one row, the conversation's scroll region is shorter; the box only pushes the conversation up when it
 would cover its last line, which it finds by asking the terminal where the cursor is (DSR).
 
+A resize is redrawn from scratch: terminals re-wrap what's on the screen when its width changes, which moves the
+old status line and box into the conversation and leaves the saved cursor pointing at the wrong place. So the
+screen keeps a transcript of everything written to the conversation, and once the window has stopped changing size
+(RESIZE_SETTLE), it clears the screen and the scrollback and prints the transcript again at the new width. Until
+then nothing is drawn (the reply's text still goes into the transcript).
+
 Esc stops a reply after the token being written, like the web page's Stop: while a reply is written, the terminal
 is in cbreak mode too and each token checks for a key press. Esc in the box clears it."""
 import codecs
@@ -40,6 +46,8 @@ CSI = "\033["
 SAVE, RESTORE = "\0337", "\0338"  # the conversation's cursor (position and text style)
 RESET, BOLD, DIM, GREEN = CSI + "0m", CSI + "1m", CSI + "2m", CSI + "32m"
 REFRESH_SECONDS = 0.25     # how often the status line is redrawn while the model works
+RESIZE_SETTLE = 0.15       # a resize is handled once the window has kept its size this long (a drag sends many)
+TRANSCRIPT_LIMIT = 4 << 20  # characters of the conversation kept for redrawing it after a resize
 SPEED_WINDOW = 16          # the live speed is over this many most recent tokens
 MAX_INPUT_ROWS = 10        # the box grows with the message up to this many rows, then scrolls
 MIN_CONVERSATION_ROWS = 3  # rows the conversation keeps however tall the box gets
@@ -311,7 +319,9 @@ class ChatScreen:
         self.tokens = 0        # tokens generated in the current reply
         self.recent = deque(maxlen=SPEED_WINDOW)  # their arrival times
         self.last_reply = ""   # the last reply's speed, for the idle status line
-        self.resized = False
+        self.resize_at = None   # when the window last changed size, until that's been handled
+        self.transcript = []    # everything written to the conversation, for redrawing it after a resize
+        self.transcript_chars = 0
         self.stop = threading.Event()
         self.stopping = False   # Esc was pressed during this reply
         self.saved_tty = None   # the terminal's settings while the box or a reply has it in cbreak mode
@@ -361,33 +371,42 @@ class ChatScreen:
     def raw(self, text: str):
         self.out.write(text)
 
-    def set_region(self):
-        """Keeps the conversation in the rows above the reserved ones, and puts its cursor on a fresh line at the
-        bottom of them."""
-        bottom = self.height - self.reserved
-        self.raw(f"{CSI}{bottom + 1};1H{CSI}J")         # clear the reserved rows (and anything left below them)
-        self.raw(f"{CSI}1;{bottom}r{CSI}{bottom};1H")   # the scroll region (which moves the cursor home), then its end
-        self.raw(SAVE)
-        self.conv_row, self.conv_col = bottom, 1
-        self.draw()
-
     def on_resize(self, signum, frame):
-        self.resized = True  # handled under the lock, by the next redraw
+        self.resize_at = time.monotonic()  # handled once the size has settled (see apply_resize)
 
-    def apply_resize(self):
-        if self.resized:
-            self.resized = False
-            self.width, self.height = shutil.get_terminal_size()
-            self.input_rows = min(self.input_rows, self.max_input_rows())
-            self.set_region()
-            self.conversation("\n")  # a line the old layout may have overdrawn, so start a new one
+    def resize_settled(self) -> bool:
+        return self.resize_at is not None and time.monotonic() - self.resize_at >= RESIZE_SETTLE
+
+    def apply_resize(self) -> bool:
+        """Once the window has settled at a new size: clears the screen and the scrollback, and prints the whole
+        conversation again at the new width, the status line and box below it. -> whether it did."""
+        if not self.resize_settled():
+            return False
+        self.resize_at = None
+        self.width, self.height = shutil.get_terminal_size()
+        self.input_rows = min(self.input_rows, self.max_input_rows())
+        bottom = self.height - self.reserved
+        self.raw(f"{RESET}{CSI}r{CSI}H{CSI}2J{CSI}3J")  # drop the scroll region, clear the screen and the scrollback
+        self.raw(f"{CSI}1;{bottom}r{CSI}1;1H")
+        self.raw("".join(self.transcript))
+        self.raw(SAVE)  # the conversation goes on where the transcript ends, in the style it ended in
+        self.conv_row, self.conv_col = bottom, 1  # until find_cursor says where that is
+        self.draw()
+        return True
 
     # The conversation
 
     def conversation(self, text: str):
         with self.lock:
-            self.raw(RESTORE + text + SAVE)
-            self.out.flush()
+            self.transcript.append(text)
+            self.transcript_chars += len(text)
+            if self.transcript_chars > TRANSCRIPT_LIMIT:  # keep the newest part, from a line's start
+                kept = "".join(self.transcript)[-TRANSCRIPT_LIMIT // 2:]
+                kept = RESET + kept[kept.find("\n") + 1:]
+                self.transcript, self.transcript_chars = [kept], len(kept)
+            if self.resize_at is None:  # mid-resize, it shows when the screen is redrawn
+                self.raw(RESTORE + text + SAVE)
+                self.out.flush()
 
     def say(self, text: str):
         self.conversation(text + "\n")
@@ -447,10 +466,11 @@ class ChatScreen:
         ed = self.editor
         pasting = after_cr = False
         while True:
-            if self.resized:
+            if self.resize_settled():
                 with self.lock:
-                    self.apply_resize()
-                    self.layout_box()
+                    if self.apply_resize():
+                        self.find_cursor(keys)  # where the redrawn conversation ends
+                        self.layout_box()
             key = keys.next()
             if key is None:
                 keys.fill(0.1)
@@ -508,7 +528,7 @@ class ChatScreen:
             elif key == "kill-word":
                 ed.cut(ed.word_left(), ed.cursor)
             after_cr = pasting and key == "enter"
-            if not keys.buf:  # redraw once a burst of keys (a paste) has been handled, not after each one
+            if not keys.buf and self.resize_at is None:  # once a burst of keys (a paste) has been handled
                 with self.lock:
                     self.layout_box()
 
@@ -615,12 +635,15 @@ class ChatScreen:
 
     def refresh_loop(self):
         """Redraws the status line while the model works, so the timer moves even while a prompt is read (when
-        no token arrives)."""
-        while not self.stop.wait(REFRESH_SECONDS):
+        no token arrives), and handles a resize once it has settled (the box handles its own while editing)."""
+        last_draw = 0.0
+        while not self.stop.wait(0.05):
             with self.lock:
-                if self.state != "idle":
-                    self.apply_resize()
+                if not self.editing and self.apply_resize():
+                    last_draw = time.monotonic()
+                elif self.state != "idle" and time.monotonic() - last_draw >= REFRESH_SECONDS:
                     self.draw()
+                    last_draw = time.monotonic()
 
     def speeds(self) -> tuple:
         """-> (tokens per second over the last SPEED_WINDOW tokens, over the whole reply so far)."""
@@ -671,7 +694,9 @@ class ChatScreen:
 
     def draw(self):
         """Draws the status line and the box, then puts the cursor back: into the box while editing, otherwise
-        where the conversation left off."""
+        where the conversation left off. Not while a resize is settling: apply_resize redraws everything."""
+        if self.resize_at is not None:
+            return
         w, n = self.width, self.input_rows
         top = self.height - self.reserved + 1  # the status line's row
         inner, avail = max(0, w - 2), self.box_width()

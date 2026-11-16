@@ -661,9 +661,15 @@ class Engine:
             ids.append(next_id)
             stop = False
             if stream or on_text:
-                # Decode the whole reply so multi-byte characters split across tokens come out correctly
+                # Decode the whole reply so multi-byte characters split across tokens come out correctly. A token
+                # can end partway through a character (an emoji's 4 bytes often take 2-4 tokens): the decode then
+                # ends in U+FFFD, which turns into the real character once its last bytes arrive, so nothing new
+                # is shown until then (on_text still runs, with "", for every token)
                 text = self.tokenizer.decode(ids[num_prompt:])
-                piece, printed = text[len(printed):], text
+                if text.endswith("�"):
+                    piece = ""
+                else:
+                    piece, printed = text[len(printed):], text
                 if stream:
                     print(piece, end="", flush=True)
                 if on_text:

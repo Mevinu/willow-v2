@@ -3,34 +3,48 @@ MoEEngine has (generate, continue_with, prompt_ids, reset, stats, experts); `cha
 import sys
 import time
 
+from terminal_markdown import MarkdownStream
+
 class ReplyPrinter:
     """Prints a reply to the terminal as it streams (an on_text callback). With thinking on, the reply starts inside
-    the <think> block the prompt opened: that part is printed dimmed, and the </think> tag is left out."""
+    the <think> block the prompt opened: that part is printed dimmed, and the </think> tag is left out.
+    In a terminal, the model's Markdown is shown as styled text (terminal_markdown); piped, it's left as written."""
 
-    DIM, PLAIN = ("\033[2m", "\033[0m") if sys.stdout.isatty() else ("", "")
+    STYLED = sys.stdout.isatty()
+    DIM, PLAIN = ("\033[2m", "\033[0m") if STYLED else ("", "")
 
     def __init__(self, thinking: bool):
         self.thinking = thinking
         self.answer_started = False
+        self.markdown = MarkdownStream(self.DIM if thinking else "") if self.STYLED else None
         if thinking:
             print(self.DIM, end="")
+
+    def show(self, text: str):
+        print(self.markdown.feed(text) if self.markdown else text, end="", flush=True)
 
     def __call__(self, piece: str) -> bool:
         if self.thinking:
             thought, tag, piece = piece.partition("</think>")  # </think> is one token, so it arrives whole
-            print(thought, end="", flush=True)
+            self.show(thought)
             if not tag:
                 return False
             self.thinking = False
+            if self.markdown:
+                print(self.markdown.finish(), end="")
+                self.markdown = MarkdownStream()
             print(self.PLAIN + "\n", end="")
         if not self.answer_started:  # the model puts blank lines after </think>
             piece = piece.lstrip("\n")
             self.answer_started = bool(piece)
-        print(piece, end="", flush=True)
+        self.show(piece)
         return False
 
     def finish(self):
-        """Ends the reply's line, and the dimming if it stopped mid-thought."""
+        """Ends the reply's line (showing anything the Markdown display still held back), and the dimming if it
+        stopped mid-thought."""
+        if self.markdown:
+            print(self.markdown.finish(), end="")
         print(self.PLAIN if self.thinking else "")
         self.thinking = False
 
