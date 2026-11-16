@@ -34,44 +34,85 @@ class ReplyPrinter:
         print(self.PLAIN if self.thinking else "")
         self.thinking = False
 
-def run_chat(load, max_new_tokens: int, think: bool):
+class PlainChat:
+    """The chat's plain terminal output (`chat --plain`, and whenever stdin or stdout isn't a terminal): messages
+    typed after a `>` prompt, and each reply followed by a summary line. Has the same methods as ChatScreen."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def say(self, text: str):
+        print(text)
+
+    def read(self) -> str:
+        return input("\n> ").strip()
+
+    def begin(self, message: str, prompt_tokens: int):
+        print()
+
+    def token(self) -> bool:
+        return False
+
+    def end(self, summary: str):
+        print(f"\n[{summary}]")
+
+def run_chat(load, max_new_tokens: int, think: bool, title: str = "willow", plain: bool = False):
     """An interactive chat (`main.py chat`). The model keeps the whole conversation in its caches, so each reply
     only processes the new message. /reset starts a new conversation; /exit, Ctrl-D or Ctrl-C quits.
-    load() builds the engine."""
+    load() builds the engine. In a terminal, the chat fills the window (chat_screen.ChatScreen): a status line
+    with the live token speed and an input box stay at the bottom, and Esc stops a reply. plain (or no terminal)
+    prints it line by line."""
     engine = load()
     if not engine.chat:
         raise SystemExit("chat needs a chat model (this one has no chat format)")
     engine.think = think
-    print("\nchat: type a message and press Enter. /think turns thinking on or off, /reset starts over, "
-          "/exit (or Ctrl-D) quits.")
-    print(f"(thinking {'on' if think else 'off'})")
+    if plain or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        ui = PlainChat()
+    else:
+        from chat_screen import ChatScreen
+        ui = ChatScreen(title, engine)
     printer = None
     try:
-        while True:
-            try:
-                message = input("\n> ").strip()
-            except EOFError:
-                break
-            if message == "/exit":
-                break
-            if message == "/reset":
-                engine.reset()
-                print("(new conversation)")
-                continue
-            if message == "/think":
-                engine.think = not engine.think
-                print(f"(thinking {'on' if engine.think else 'off'})")
-                continue
-            if not message:
-                continue
-            print()
-            printer = ReplyPrinter(engine.think)
-            engine.continue_with(engine.prompt_ids(message), max_new_tokens, on_text=printer)
-            printer.finish()
-            read, reply = engine.stats["prefill"], engine.stats["decode"]
-            speed = f" at {reply['tokens'] / reply['seconds']:.1f} tok/s" if reply["tokens"] else ""
-            print(f"\n[{reply['tokens']} tokens{speed}; read your message in {read['seconds']:.1f}s; "
-                  f"conversation so far: {engine.position} tokens]")
+        with ui:
+            esc = "" if isinstance(ui, PlainChat) else "Esc stops a reply, "
+            ui.say(("\n" if isinstance(ui, PlainChat) else "") +
+                   "chat: type a message and press Enter. /think turns thinking on or off, /reset starts over, "
+                   f"{esc}/exit (or Ctrl-D) quits.")
+            ui.say(f"(thinking {'on' if think else 'off'})")
+            while True:
+                try:
+                    message = ui.read()
+                except EOFError:
+                    break
+                if message == "/exit":
+                    break
+                if message == "/reset":
+                    engine.reset()
+                    ui.say("(new conversation)")
+                    continue
+                if message == "/think":
+                    engine.think = not engine.think
+                    ui.say(f"(thinking {'on' if engine.think else 'off'})")
+                    continue
+                if not message:
+                    continue
+                ids = engine.prompt_ids(message)
+                printer = ReplyPrinter(engine.think)
+
+                def on_text(piece: str) -> bool:
+                    stop = ui.token()  # True once Esc is pressed: the reply ends after this token
+                    return printer(piece) or stop
+                ui.begin(message, len(ids))
+                engine.continue_with(ids, max_new_tokens, on_text=on_text)
+                printer.finish()
+                printer = None
+                read, reply = engine.stats["prefill"], engine.stats["decode"]
+                speed = f" at {reply['tokens'] / reply['seconds']:.1f} tok/s" if reply["tokens"] else ""
+                ui.end(f"{reply['tokens']} tokens{speed}; read your message in {read['seconds']:.1f}s; "
+                       f"conversation so far: {engine.position} tokens")
     except KeyboardInterrupt:  # mid-reply, this leaves the caches half-updated, so it quits rather than continues
         if printer:
             printer.finish()

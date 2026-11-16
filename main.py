@@ -61,6 +61,8 @@ def main():
 
     chat = commands.add_parser("chat", help="Chat with the model; it remembers the conversation")
     chat.add_argument("model", help=MODEL_HELP)
+    chat.add_argument("--plain", action="store_true",
+                      help="Print the chat line by line, without the live status line and input box")
     add_run_options(chat)
 
     web = commands.add_parser("web", help="Chat in a web page on this computer; it remembers the "
@@ -101,7 +103,7 @@ def main():
         return
     from runner import run_chat, run_prompt
     if args.command == "chat":
-        run_chat(lambda: load_model(entry), args.max_new_tokens, args.think)
+        run_chat(lambda: load_model(entry), args.max_new_tokens, args.think, entry["name"], args.plain)
     else:
         run_prompt(lambda: load_model(entry), args.prompt, args.max_new_tokens, args.think)
 
