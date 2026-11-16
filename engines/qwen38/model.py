@@ -12,6 +12,7 @@ gated full attention, a shared expert plus 10 of 512 routed experts), wired diff
 Written against transformers' modular_qwen4_exp.py (Qwen4ExpTextGatedResidual, Qwen4ExpTextNGramEmbedding,
 Qwen4ExpTextPLELayer, Qwen4ExpTextDecoderLayer, Qwen4ExpTextModel)."""
 import math
+import os
 import time
 
 import torch
@@ -26,6 +27,32 @@ def grouped_rms_norm(x: torch.Tensor, weight: torch.Tensor, groups: int, eps: fl
     x32 = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
     return (x32.reshape(x.shape) * (1.0 + weight.float())).type_as(x)
 
+def hc_matmul(x: torch.Tensor, weight) -> torch.Tensor:
+    """F.linear(x, weight), for a bf16 weight or an int8 one given as (q, scales): the same math as
+    quants.Int8Weight.linear, written on its tensors so torch.compile can trace it."""
+    if isinstance(weight, torch.Tensor):
+        return F.linear(x, weight)
+    q, scales = weight
+    y = torch._weight_int8pack_mm(x.reshape(-1, x.shape[-1]).to(scales.dtype), q, scales)
+    return y.view(*x.shape[:-1], y.shape[-1]).to(x.dtype)
+
+def hc_step(x, out, gates, norm_w, down, up, inject, hc: int, eps: float):
+    """The gated residual (Qwen4ExpTextGatedResidual), as a plain function of tensors so it can be compiled.
+    If out is given, first adds that block's output [tokens, hidden] to every stream of x [tokens, hc * hidden],
+    scaled by the stream's gate from gates [tokens, hc] (the write). Then reads the next block's input from the
+    streams (the read). -> (x, the block's input [tokens, hidden], its write gates [tokens, hc], or None when
+    inject is None)."""
+    if out is not None:
+        x = x + (out[:, None, :] * gates[:, :, None]).flatten(1)
+    xn = grouped_rms_norm(x, norm_w, hc, eps)
+    read = F.silu(hc_matmul(xn, down) / hc)
+    read = torch.sigmoid(hc_matmul(read, up))
+    shape = (x.shape[0], hc, x.shape[1] // hc)
+    mixed = (read.view(shape) * xn.view(shape)).mean(dim=-2)
+    if inject is None:
+        return x, mixed, None
+    return x, mixed, 2 * torch.sigmoid(hc_matmul(xn, inject) / hc)
+
 class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
     prefetch_top_k = 10  # Qwen3.8 routes to 10 experts
     prefix = "model.language_model."
@@ -38,6 +65,14 @@ class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
         for a GGUF). Needed when the config has PLE layers."""
         self.ple_table = ple_table
         super().__init__(cfg, eos_ids, weights, experts, tokenizer, device)
+        # While decoding on the GPU, hc_step is compiled: it's ~15 small ops, run 3 times a layer (attention, MoE,
+        # and the next layer's expert guess). emulate_precision_casts rounds to bf16 wherever eager torch does,
+        # so the compiled steps give exactly the eager result. WILLOW_COMPILED_HC=0 runs it as it is
+        self.hc_step = hc_step
+        if self.ops.compiled and os.environ.get("WILLOW_COMPILED_HC", "1") != "0":
+            compiled = torch.compile(hc_step, dynamic=False, options={"emulate_precision_casts": True})
+            self.hc_step = self.ops.dispatch(hc_step, compiled)
+        self.hc_args = {}  # hyper-connection prefix -> its weights, as hc_step takes them
 
     def setup(self, cfg: dict):
         super().setup(cfg)
@@ -77,18 +112,20 @@ class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
 
     # The gated residual (Qwen4ExpTextGatedResidual)
 
-    def hc_read(self, x: torch.Tensor, p: str, write: bool = True):
-        """x [tokens, hc * hidden] -> (the block's input [tokens, hidden], its per-stream write gates [tokens, hc]
-        or None)."""
-        hc = self.hc_count
-        xn = grouped_rms_norm(x, self.w(p + ".hc_norm.weight"), hc, self.eps)
-        read = F.silu(self.linear(xn, p + ".input_mix_weight_down") / hc)
-        read = torch.sigmoid(self.linear(read, p + ".input_mix_weight_up"))
-        shape = (x.shape[0], hc, self.hidden)
-        mixed = (read.view(shape) * xn.view(shape)).mean(dim=-2)
-        if not write:
-            return mixed, None
-        return mixed, 2 * torch.sigmoid(self.linear(xn, p + ".block_inject_weight") / hc)
+    def hc(self, x: torch.Tensor, p: str, pending: tuple = None, write: bool = True):
+        """Adds pending, a block's (output, write gates), to the streams x [tokens, hc * hidden] if given, then reads
+        the next block's input through the mixer at p (see hc_step). -> (x, the block's input [tokens, hidden], its
+        write gates [tokens, hc] or None)."""
+        if p not in self.hc_args:
+            def weight(name):
+                assert self.weights.get(f"{p}.{name}.bias") is None
+                w = self.weights.get(f"{p}.{name}.weight")
+                return w if w is None or isinstance(w, torch.Tensor) else (w.q, w.scales)  # an Int8Weight
+            self.hc_args[p] = (self.w(p + ".hc_norm.weight"), weight("input_mix_weight_down"),
+                               weight("input_mix_weight_up"), weight("block_inject_weight"))
+        norm_w, down, up, inject = self.hc_args[p]
+        out, gates = pending if pending is not None else (None, None)
+        return self.hc_step(x, out, gates, norm_w, down, up, inject if write else None, self.hc_count, self.eps)
 
     @staticmethod
     def hc_write(x: torch.Tensor, out: torch.Tensor, gates: torch.Tensor) -> torch.Tensor:
@@ -96,7 +133,7 @@ class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
         return x + (out[:, None, :] * gates[:, :, None]).flatten(1)
 
     def router_guess_input(self, residual: torch.Tensor, layer: int) -> torch.Tensor:
-        return self.hc_read(residual, f"{self.prefix}layers.{layer}.mlp_hyper_connection", write=False)[0]
+        return self.hc(residual, f"{self.prefix}layers.{layer}.mlp_hyper_connection", write=False)[1]
 
     # PLE: hashed n-gram embeddings (Qwen4ExpTextNGramEmbedding and Qwen4ExpTextPLELayer)
 
@@ -161,23 +198,28 @@ class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
             self.warned_dense = True
         x = self.embed(token_ids).repeat(1, self.hc_count)  # hc identical copies of the embedding
         cos, sin = self.rope(len(token_ids))
+        # Each block's output is added to the streams by the next hc call (one compiled step for the write and the
+        # read that follows it), so pending is (the last block's output, its write gates) until then
+        pending = None
         for layer in range(self.num_layers):
             p = f"{self.prefix}layers.{layer}"
             t = time.perf_counter()
             if layer in self.ple_layers:
+                if pending is not None:  # PLE reads the streams
+                    x, pending = self.hc_write(x, *pending), None
                 x = x + self.ple(x, token_ids, layer)
                 t = self.tick("ple", t)
-            h, gates = self.hc_read(x, p + ".attn_hyper_connection")
+            x, h, gates = self.hc(x, p + ".attn_hyper_connection", pending)
             t = self.tick("hyper-connections", t)
             out = self.token_mixer(h, layer, cos, sin)
             t = self.tick(self.layer_types[layer].replace("_", " "), t)
-            x = self.hc_write(x, out, gates)
-            h, gates = self.hc_read(x, p + ".mlp_hyper_connection")
+            x, h, gates = self.hc(x, p + ".mlp_hyper_connection", (out, gates))
             self.tick("hyper-connections", t)
-            x = self.hc_write(x, self.moe(h, layer, residual=x), gates)
+            pending = (self.moe(h, layer, residual=x), gates)
         self.position += len(token_ids)
         t = time.perf_counter()
-        h, _ = self.hc_read(x, self.prefix + "hyper_connection_mixer", write=False)
-        logits = F.linear(h, self.w("lm_head.weight"))
+        x, h, _ = self.hc(x, self.prefix + "hyper_connection_mixer", pending, write=False)
+        # Only the last token's logits are used (a prompt's others would be [tokens, vocab], GiBs for a long one)
+        logits = F.linear(h[-1:], self.w("lm_head.weight"))
         self.tick("lm_head", t)
         return logits

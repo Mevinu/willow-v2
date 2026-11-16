@@ -111,6 +111,9 @@ def print_stats(engine, load_seconds: float):
         print(f"{name + ':':9} {s['tokens']:4d} tokens in {s['seconds']:6.1f}s = {s['tokens'] / s['seconds']:6.2f} tok/s | "
               f"cache hits {hit_rate:3.0f}% | {gib:6.2f} GiB read ({gib / s['tokens']:.2f} GiB/token) | "
               f"disk {io_share:3.0f}% of time at {io_speed:.1f} GiB/s")
+        if s.get("gpu_memory"):
+            live, held = (b / 1024**3 for b in s["gpu_memory"])
+            print(f"{'':9} GPU memory at the end: {live:.2f} GiB in tensors, {held:.2f} GiB held by the allocator")
         if s["prefetches"]:
             print(f"{'':9} prefetch: {s['prefetches']} next-layer reads started, "
                   f"{s['prefetch_used'] / s['prefetches'] * 100:.0f}% of them used")

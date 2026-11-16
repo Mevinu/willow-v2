@@ -39,12 +39,51 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, rotary_dim
 
 def attention_core(q, k, v, mask, gate, groups: int, scale: float) -> torch.Tensor:
     """q [heads, seq, dim], k and v [kv_heads, capacity, dim], mask [seq, capacity] -> [seq, heads * dim]."""
-    # Grouped-query attention: each KV head serves num_heads / num_kv_heads query heads
-    k = k.repeat_interleave(groups, dim=0)
-    v = v.repeat_interleave(groups, dim=0)
-    scores = (q @ k.transpose(1, 2)) * scale + mask
+    # Grouped-query attention: each KV head serves num_heads / num_kv_heads query heads (query head h uses kv head
+    # h // groups, as repeat_interleave would give). Each kv head's group of query heads is stacked into one batch,
+    # so k and v are used as they are: copying them per query head (repeat_interleave) made groups copies of the
+    # whole cache per layer per token (12 for Qwen3.8, ~750 MiB per layer at 32k tokens)
+    heads, seq, dim = q.shape
+    kv_heads, capacity = k.shape[0], k.shape[1]
+    scores = (q.reshape(kv_heads, groups * seq, dim) @ k.transpose(1, 2)) * scale
+    scores = scores.view(kv_heads, groups, seq, capacity) + mask
     probs = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-    out = (probs @ v).transpose(0, 1).reshape(q.shape[1], q.shape[0] * q.shape[2])
+    out = probs.view(kv_heads, groups * seq, capacity) @ v  # [kv_heads, groups * seq, dim]
+    out = out.view(heads, seq, dim).transpose(0, 1).reshape(seq, heads * dim)
+    if gate is not None:
+        out = out * torch.sigmoid(gate)
+    return out
+
+# A prompt's attention scores are worked out a slice of queries at a time, each slice's working memory (the
+# scores in fp32 and bf16, and the probabilities: ~10 bytes per head, query and key) kept under this. The whole
+# [heads, prompt, prompt] table at once would need ~6 GiB at 8k tokens and grows with the square of the length.
+# WILLOW_PREFILL_ATTENTION_MB overrides it
+PREFILL_ATTENTION_BYTES = int(os.environ.get("WILLOW_PREFILL_ATTENTION_MB", "512")) << 20
+
+def prefill_attention(q, k, v, start: int, gate, groups: int, scale: float) -> torch.Tensor:
+    """attention_core for a prompt: the same math, in slices of queries, so its memory stays near
+    PREFILL_ATTENTION_BYTES whatever the length. q [heads, seq, dim] holds the queries at positions start on; k and
+    v [kv_heads, start + seq, dim] every key written so far. Each kv head serves its group of query heads directly
+    (no copy of k and v per query head). Every slice runs over all the keys, the later ones masked off: on the GPU,
+    slices that each stopped at their last query's key had a new shape each, and MPS kept a buffer per shape
+    (16 GiB and 65 s for one 16k-token layer, against 1 GiB and 3 s like this). -> [seq, heads * dim]."""
+    heads, seq, dim = q.shape
+    kv_heads, keys = k.shape[0], k.shape[1]
+    step = max(1, min(seq, PREFILL_ATTENTION_BYTES // (10 * heads * keys)))
+    q = q.view(kv_heads, groups, seq, dim)  # query head h uses kv head h // groups, as repeat_interleave does
+    kt = k.transpose(1, 2)
+    key_pos = torch.arange(keys, device=q.device)
+    out = q.new_empty(seq, heads * dim)
+    for i in range(0, seq, step):
+        j = min(i + step, seq)
+        rows = j - i
+        qs = q[:, :, i:j].reshape(kv_heads, groups * rows, dim)
+        scores = ((qs @ kt) * scale).view(kv_heads, groups, rows, keys)
+        limit = torch.arange(start + i, start + j, device=q.device)[:, None]
+        mask = torch.zeros(rows, keys, device=q.device).masked_fill(key_pos[None, :] > limit, float("-inf"))
+        probs = F.softmax(scores + mask, dim=-1, dtype=torch.float32).to(q.dtype)
+        o = probs.view(kv_heads, groups * rows, keys) @ v  # [kv_heads, groups * rows, dim]
+        out[i:j] = o.view(heads, rows, dim).transpose(0, 1).reshape(rows, heads * dim)
     if gate is not None:
         out = out * torch.sigmoid(gate)
     return out
@@ -219,6 +258,22 @@ class Engine:
         self.experts = experts
         self.tokenizer = tokenizer
         self.reset()
+        self.release_gpu_memory()  # what loading left in the GPU allocator's cache
+
+    def release_gpu_memory(self):
+        """Gives the GPU allocator's cached blocks back to macOS. PyTorch's MPS allocator keeps freed buffers for
+        reuse, so without this, every temporary ever made (loading, a prompt's attention slices and expert
+        batches, each old KV cache) stays allocated: memory that the context and the OS can't use. Called after
+        loading, after each prompt, and when the KV cache has grown while decoding (every KV_BLOCK tokens)."""
+        self.kv_grew = False
+        if self.device.type == "mps":
+            torch.mps.empty_cache()
+
+    def gpu_memory(self) -> tuple:
+        """-> (bytes in live GPU tensors, bytes the GPU allocator holds, cache included), or None on the CPU."""
+        if self.device.type != "mps":
+            return None
+        return torch.mps.current_allocated_memory(), torch.mps.driver_allocated_memory()
 
     def setup(self, cfg: dict):
         self.num_layers = cfg["num_hidden_layers"]
@@ -239,6 +294,7 @@ class Engine:
 
     def reset(self):
         self.kv_cache = [None] * self.num_layers  # per layer: (keys, values), each [kv_heads, capacity, head_dim]
+        self.kv_grew = False
         self.mask_key = None
         self.position = 0
         self.timings = defaultdict(float)
@@ -299,11 +355,15 @@ class Engine:
                 for new, old in zip(grown, cache):
                     new[:, :self.position] = old[:, :self.position]
             cache = self.kv_cache[layer] = grown
+            self.kv_grew = True  # the old cache is now free GPU memory (see release_gpu_memory)
         cache[0][:, self.position:end] = k
         cache[1][:, self.position:end] = v
         k, v = cache
-        out = self.ops.attention_core(q, k, v, self.attention_mask(seq_len, k.shape[1]), gate,
-                                      self.num_heads // self.num_kv_heads, self.head_dim ** -0.5)
+        groups, scale = self.num_heads // self.num_kv_heads, self.head_dim ** -0.5
+        if seq_len == 1:  # decode: over the whole cache, so its shapes stay fixed for the compiled attention_core
+            out = self.ops.attention_core(q, k, v, self.attention_mask(seq_len, k.shape[1]), gate, groups, scale)
+        else:
+            out = prefill_attention(q, k[:, :end], v[:, :end], self.position, gate, groups, scale)
         return self.linear(out, p + ".o_proj")
 
     def attention_mask(self, seq_len: int, capacity: int) -> torch.Tensor:
@@ -566,6 +626,7 @@ class Engine:
             "prefetches": e.prefetches - start[5],
             "prefetch_used": e.prefetch_used - start[6],
             "timings": timings,
+            "gpu_memory": self.gpu_memory(),  # before release_gpu_memory: what the phase left allocated
         }
 
     def generate(self, prompt: str, max_new_tokens: int = 100, stream: bool = False, on_text=None) -> list:
@@ -586,6 +647,7 @@ class Engine:
         start = self.io_snapshot()
         logits = self.forward(ids)
         self.record_phase("prefill", num_prompt, start)
+        self.release_gpu_memory()  # a prompt's temporaries (attention slices, expert batches) are the biggest
 
         # Decode phase: each step forwards the previous token. The first token comes from the prefill logits,
         # so the timed decode tokens are the forward passes after it.
@@ -608,9 +670,12 @@ class Engine:
                     stop = bool(on_text(piece))
             logits = self.forward([next_id])
             decode_steps += 1
+            if self.kv_grew:
+                self.release_gpu_memory()
             if stop:
                 break
         self.record_phase("decode", decode_steps, start)
+        self.release_gpu_memory()
         if stream:
             print()
         return ids

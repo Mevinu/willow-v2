@@ -22,7 +22,8 @@ class MoEEngine(Engine):
             x = x + self.moe(self.rms_norm(x, p + ".post_attention_layernorm.weight"), layer, residual=x)
         self.position += len(token_ids)
         t = time.perf_counter()
-        logits = F.linear(self.rms_norm(x, self.prefix + "norm.weight"), self.w("lm_head.weight"))
+        # Only the last token's logits are used (a prompt's others would be [tokens, vocab], GiBs for a long one)
+        logits = F.linear(self.rms_norm(x[-1:], self.prefix + "norm.weight"), self.w("lm_head.weight"))
         self.tick("lm_head", t)
         return logits
 
