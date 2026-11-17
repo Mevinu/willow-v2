@@ -313,7 +313,8 @@ class ChatScreen:
         self.title, self.engine = title, engine
         self.out = sys.stdout  # the real terminal
         self.lock = threading.RLock()
-        self.state = "idle"    # "idle", "reading" (the prompt's prefill) or "writing" (decoding)
+        self.state = "idle"    # "idle", "reading" (the prompt's prefill), "writing" (decoding) or "browsing" (a tool)
+        self.tool_text = ""    # what the reply's last tool call does (see tool)
         self.started = 0.0     # when the current phase began
         self.prompt_tokens = 0
         self.tokens = 0        # tokens generated in the current reply
@@ -571,6 +572,22 @@ class ChatScreen:
         with self.lock:
             self.conversation(f"\n{BOLD}› {message.replace(chr(10), chr(10) + '  ')}{RESET}\n\n")
             self.state, self.started, self.prompt_tokens = "reading", time.perf_counter(), prompt_tokens
+            self.tokens, self.tool_text = 0, ""
+            self.recent.clear()
+            self.draw()
+
+    def tool(self, text: str):
+        """The reply has called a tool (text says what it does), which runs now."""
+        with self.lock:
+            self.conversation(f"{DIM}↳ {text}{RESET}\n")
+            self.state, self.started, self.tool_text = "browsing", time.perf_counter(), text
+            self.draw()
+
+    def resume(self, prompt_tokens: int):
+        """The tool results go back to the model: its prefill, before the reply carries on."""
+        with self.lock:
+            self.conversation("\n")
+            self.state, self.started, self.prompt_tokens = "reading", time.perf_counter(), prompt_tokens
             self.tokens = 0
             self.recent.clear()
             self.draw()
@@ -661,8 +678,12 @@ class ChatScreen:
         context = f"context {self.engine.position:,}"
         if self.state == "reading":
             elapsed = time.perf_counter() - self.started
-            return ([(f" reading your message: {self.prompt_tokens:,} tokens · {elapsed:.1f}s", "")],
+            what = "the results" if self.tool_text else "your message"
+            return ([(f" reading {what}: {self.prompt_tokens:,} tokens · {elapsed:.1f}s", "")],
                     "Esc stops · Ctrl-C quits")
+        if self.state == "browsing":
+            elapsed = time.perf_counter() - self.started
+            return [(f" {self.tool_text} · {elapsed:.1f}s", "")], "Ctrl-C quits"
         if self.state == "writing":
             live, average = self.speeds()
             elapsed = time.perf_counter() - self.started
@@ -675,7 +696,9 @@ class ChatScreen:
         left = [(f" {self.title}", BOLD), (f" · {context} · thinking {thinking}", "")]
         if self.last_reply:
             left.append((f" · last reply {self.last_reply}", ""))
-        return left, "/think /reset /exit"
+        browsing = "on" if self.engine.system else "off"
+        left[1] = (f" · {context} · thinking {thinking} · browsing {browsing}", "")
+        return left, "/think /browse /reset /exit"
 
     def status_line(self) -> str:
         w = self.width

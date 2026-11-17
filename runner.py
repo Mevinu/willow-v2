@@ -3,6 +3,7 @@ MoEEngine has (generate, continue_with, prompt_ids, reset, stats, experts); `cha
 import sys
 import time
 
+import web_tools
 from terminal_markdown import MarkdownStream
 
 class ReplyPrinter:
@@ -16,6 +17,7 @@ class ReplyPrinter:
     def __init__(self, thinking: bool):
         self.thinking = thinking
         self.answer_started = False
+        self.calling = False  # the reply has reached a tool call: the rest is for the chat to run, not to show
         self.markdown = MarkdownStream(self.DIM if thinking else "") if self.STYLED else None
         if thinking:
             print(self.DIM, end="")
@@ -34,9 +36,15 @@ class ReplyPrinter:
                 print(self.markdown.finish(), end="")
                 self.markdown = MarkdownStream()
             print(self.PLAIN + "\n", end="")
+        if self.calling:
+            return False
+        piece, tag, _ = piece.partition("<tool_call>")  # one token, so it arrives whole
+        self.calling = bool(tag)
         if not self.answer_started:  # the model puts blank lines after </think>
             piece = piece.lstrip("\n")
             self.answer_started = bool(piece)
+        if self.calling:
+            piece = piece.rstrip("\n")
         self.show(piece)
         return False
 
@@ -64,7 +72,15 @@ class PlainChat:
     def read(self) -> str:
         return input("\n> ").strip()
 
+    stopping = False
+
     def begin(self, message: str, prompt_tokens: int):
+        print()
+
+    def tool(self, text: str):
+        print(f"({text})")
+
+    def resume(self, prompt_tokens: int):
         print()
 
     def token(self) -> bool:
@@ -73,16 +89,19 @@ class PlainChat:
     def end(self, summary: str):
         print(f"\n[{summary}]")
 
-def run_chat(load, max_new_tokens: int, think: bool, title: str = "willow", plain: bool = False):
+def run_chat(load, max_new_tokens: int, think: bool, title: str = "willow", plain: bool = False,
+             browse: bool = False):
     """An interactive chat (`main.py chat`). The model keeps the whole conversation in its caches, so each reply
     only processes the new message. /reset starts a new conversation; /exit, Ctrl-D or Ctrl-C quits.
     load() builds the engine. In a terminal, the chat fills the window (chat_screen.ChatScreen): a status line
     with the live token speed and an input box stay at the bottom, and Esc stops a reply. plain (or no terminal)
-    prints it line by line."""
+    prints it line by line. browse (or /browse) lets the model search the web and read pages (web_tools): it
+    calls the tools mid-reply, and each result goes back to it before it carries on."""
     engine = load()
     if not engine.chat:
         raise SystemExit("chat needs a chat model (this one has no chat format)")
     engine.think = think
+    engine.system = web_tools.system_prompt() if browse else None
     if plain or not (sys.stdin.isatty() and sys.stdout.isatty()):
         ui = PlainChat()
     else:
@@ -93,9 +112,10 @@ def run_chat(load, max_new_tokens: int, think: bool, title: str = "willow", plai
         with ui:
             esc = "" if isinstance(ui, PlainChat) else "Esc stops a reply, "
             ui.say(("\n" if isinstance(ui, PlainChat) else "") +
-                   "chat: type a message and press Enter. /think turns thinking on or off, /reset starts over, "
+                   "chat: type a message and press Enter. /think turns thinking on or off, /browse turns web browsing "
+                   "on or off, /reset starts over, "
                    f"{esc}/exit (or Ctrl-D) quits.")
-            ui.say(f"(thinking {'on' if think else 'off'})")
+            ui.say(f"(thinking {'on' if think else 'off'}; web browsing {'on' if browse else 'off'})")
             while True:
                 try:
                     message = ui.read()
@@ -111,21 +131,43 @@ def run_chat(load, max_new_tokens: int, think: bool, title: str = "willow", plai
                     engine.think = not engine.think
                     ui.say(f"(thinking {'on' if engine.think else 'off'})")
                     continue
+                if message == "/browse":
+                    engine.system = None if engine.system else web_tools.system_prompt()
+                    engine.reset()  # the tools are described in the system message, at the conversation's start
+                    ui.say(f"(web browsing {'on' if engine.system else 'off'}; new conversation)")
+                    continue
                 if not message:
                     continue
                 ids = engine.prompt_ids(message)
-                printer = ReplyPrinter(engine.think)
-
-                def on_text(piece: str) -> bool:
-                    stop = ui.token()  # True once Esc is pressed: the reply ends after this token
-                    return printer(piece) or stop
                 ui.begin(message, len(ids))
-                engine.continue_with(ids, max_new_tokens, on_text=on_text)
-                printer.finish()
-                printer = None
-                read, reply = engine.stats["prefill"], engine.stats["decode"]
-                speed = f" at {reply['tokens'] / reply['seconds']:.1f} tok/s" if reply["tokens"] else ""
-                ui.end(f"{reply['tokens']} tokens{speed}; read your message in {read['seconds']:.1f}s; "
+                tokens = seconds = read_seconds = 0.0
+                for round_ in range(web_tools.MAX_TOOL_ROUNDS + 1):
+                    printer = ReplyPrinter(engine.think)
+
+                    def on_text(piece: str) -> bool:
+                        stop = ui.token()  # True once Esc is pressed: the reply ends after this token
+                        return printer(piece) or stop
+                    out = engine.continue_with(ids, max_new_tokens, on_text=on_text)
+                    printer.finish()
+                    printer = None
+                    tokens += engine.stats["decode"]["tokens"]
+                    seconds += engine.stats["decode"]["seconds"]
+                    read_seconds += engine.stats["prefill"]["seconds"]
+                    calls = web_tools.parse_tool_calls(engine.tokenizer.decode(out[len(ids):]))
+                    if not (engine.system and calls) or ui.stopping:
+                        break
+                    results = []
+                    for name, args in calls:
+                        ui.tool(web_tools.describe(name, args))
+                        if round_ < web_tools.MAX_TOOL_ROUNDS:
+                            results.append(web_tools.run_tool(name, args))
+                        else:  # the model gets one more reply, to answer with what it has
+                            results.append("Error: no more tool calls for this message; answer with what you "
+                                           "have found so far.")
+                    ids = engine.tool_result_ids(results)
+                    ui.resume(len(ids))
+                speed = f" at {tokens / seconds:.1f} tok/s" if tokens else ""
+                ui.end(f"{tokens:.0f} tokens{speed}; read your message in {read_seconds:.1f}s; "
                        f"conversation so far: {engine.position} tokens")
     except KeyboardInterrupt:  # mid-reply, this leaves the caches half-updated, so it quits rather than continues
         if printer:

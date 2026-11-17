@@ -781,11 +781,28 @@ class QwenChat:
 
     chat = True
     think = False
+    # A system message for the start of each conversation, e.g. web_tools.system_prompt() to let the model call
+    # tools. Changing it only takes effect from the next conversation (reset)
+    system = None
 
     def prompt_ids(self, prompt: str) -> list:
         # Qwen chat format; an empty think block turns thinking off. Mid-chat (position > 0), it first closes the
         # previous reply: continue_with stops on its end token without running it through the model.
-        text = "<|im_end|>\n" if self.position else ""
-        text += f"<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
-        text += "<think>\n" if self.think else "<think>\n\n</think>\n\n"
+        if self.position:
+            text = "<|im_end|>\n"
+        else:
+            text = f"<|im_start|>system\n{self.system}<|im_end|>\n" if self.system else ""
+        text += f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        return self.encode_turn(text)
+
+    def tool_result_ids(self, results: list) -> list:
+        """After a reply that ended with tool calls: closes it and hands the model each call's result (as the chat
+        template does, in one user turn of <tool_response> blocks), then opens its next reply."""
+        text = "<|im_end|>\n<|im_start|>user"
+        text += "".join(f"\n<tool_response>\n{result}\n</tool_response>" for result in results)
+        return self.encode_turn(text + "<|im_end|>\n")
+
+    def encode_turn(self, text: str) -> list:
+        """text, then the start of the assistant's reply (an empty think block turns thinking off) -> token ids."""
+        text += "<|im_start|>assistant\n" + ("<think>\n" if self.think else "<think>\n\n</think>\n\n")
         return self.tokenizer.encode(text, add_special_tokens=False).ids

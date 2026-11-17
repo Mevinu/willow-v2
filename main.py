@@ -63,6 +63,9 @@ def main():
     chat.add_argument("model", help=MODEL_HELP)
     chat.add_argument("--plain", action="store_true",
                       help="Print the chat line by line, without the live status line and input box")
+    chat.add_argument("--browse", action="store_true",
+                      help="Let the model search the web and read pages (also /browse in the chat). Search uses "
+                           "Brave's API if BRAVE_API_KEY is set, else SearXNG at WILLOW_SEARXNG_URL")
     add_run_options(chat)
 
     web = commands.add_parser("web", help="Chat in a web page on this computer; it remembers the "
@@ -103,7 +106,8 @@ def main():
         return
     from runner import run_chat, run_prompt
     if args.command == "chat":
-        run_chat(lambda: load_model(entry), args.max_new_tokens, args.think, entry["name"], args.plain)
+        run_chat(lambda: load_model(entry), args.max_new_tokens, args.think, entry["name"], args.plain,
+                 args.browse)
     else:
         run_prompt(lambda: load_model(entry), args.prompt, args.max_new_tokens, args.think)
 
