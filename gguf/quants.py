@@ -176,6 +176,18 @@ def dequant_iq2_s(b):
     db = d * (0.5 + scales) * 0.25                                                          # [n, 16]
     return (db[:, :, None] * grid * signs).reshape(n, QK_K)
 
+def dequant_iq3_s(b):
+    # 64 grid indices (4 values each; low 8 bits in qs, the 9th in qh), 32 bytes of explicit signs, then one 4-bit
+    # scale per 32 values
+    n = b.shape[0]
+    d = _f16(b[:, :2])
+    qh = ((b[:, 66:74, None] >> _shifts(*range(8))) & 1).reshape(n, 64).long()
+    grid = _iq_grid("IQ3_S_GRID")[b[:, 2:66].long() | (qh << 8)].reshape(n, 8, 32)
+    signs = _sign_bits(b[:, 74:106]).reshape(n, 8, 32)
+    scales = ((b[:, 106:110, None] >> _shifts(0, 4)) & 0x0F).reshape(n, 8).float()
+    db = d * (1 + 2 * scales)                                                               # [n, 8]
+    return (db[:, :, None] * grid * signs).reshape(n, QK_K)
+
 def dequant_q2_0(b):
     # Value j is bits 2 * (j % 4) of byte j // 4 (ggml's dequantize_row_q2_0): 0, 1, 2, 3 -> -1, 0, +1, +2
     d = _f16(b[:, :2])
@@ -186,7 +198,7 @@ DEQUANTIZERS = {
     "Q4_0": dequant_q4_0, "Q4_1": dequant_q4_1, "Q5_0": dequant_q5_0, "Q5_1": dequant_q5_1, "Q8_0": dequant_q8_0,
     "Q2_K": dequant_q2_k, "Q3_K": dequant_q3_k, "Q4_K": dequant_q4_k, "Q5_K": dequant_q5_k, "Q6_K": dequant_q6_k,
     "IQ4_NL": dequant_iq4_nl, "IQ4_XS": dequant_iq4_xs, "IQ3_XXS": dequant_iq3_xxs, "IQ2_S": dequant_iq2_s,
-    "Q2_0": dequant_q2_0,
+    "IQ3_S": dequant_iq3_s, "Q2_0": dequant_q2_0,
 }
 FLOAT_TYPES = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16}
 SUPPORTED_TYPES = set(DEQUANTIZERS) | set(FLOAT_TYPES)
@@ -355,7 +367,7 @@ PACK_LAYOUTS = {"Q4_K": ("INT4_G32", int4_nbytes, q4_k_to_int4), "Q6_K": ("INT4_
 PACK_LAYOUTS_GPU = {}
 # Qwen3.8-Flash-Next's expert types (Unsloth's UD quants). A CPU pack has no kernels for them, so they're requantized
 # with the per-group search
-for _type in ("Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ2_S", "Q2_0"):
+for _type in ("Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ3_S", "IQ2_S", "Q2_0"):
     PACK_LAYOUTS[_type] = ("INT4_G32", int4_nbytes, functools.partial(requantize_to_int4, type_name=_type))
 INT4_LAYOUTS = {"INT4_G32", "INT4_G32_GPU"}
 INT4_ROW_MULTIPLE = 16  # torch's int4 packing needs the row count to be a multiple of 16

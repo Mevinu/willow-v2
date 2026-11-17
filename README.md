@@ -128,7 +128,7 @@ The embedding table stays quantized, and rows are dequantized as they're looked 
 
 The experts stay quantized. Turning ggml's quantized blocks back into bf16 with PyTorch takes far longer than reading them from the SSD, so they're computed straight from their quantized form:
 
-- **On the GPU** (the default), every expert stays exactly as the GGUF stores it, and willow's own Metal kernels (`gguf/metal.py`, compiled when first used) compute straight from those bytes. They cover Q4_K and Q6_K (Qwen3.6's Q4_K_M) and Qwen3.8's IQ4_XS, IQ3_XXS, IQ2_S, IQ4_NL, Q5_0 and Q2_0. The experts are exactly the published weights, and the pack is as small as the GGUF's experts (18.2 GiB for Qwen3.6, 56.4 GiB for Qwen3.8). On one token's experts the kernels are as fast as PyTorch's 4-bit kernel for Qwen3.6 (8.8 against 9.1 ms) and faster for Qwen3.8 (about 15 against 23 ms).
+- **On the GPU** (the default), every expert stays exactly as the GGUF stores it, and willow's own Metal kernels (`gguf/metal.py`, compiled when first used) compute straight from those bytes. They cover Q4_K and Q6_K (Qwen3.6's Q4_K_M) and Qwen3.8's IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ4_NL, Q5_0 and Q2_0. The experts are exactly the published weights, and the pack is as small as the GGUF's experts (18.2 GiB for Qwen3.6, 56.4 GiB for Qwen3.8). On one token's experts the kernels are as fast as PyTorch's 4-bit kernel for Qwen3.6 (8.8 against 9.1 ms) and faster for Qwen3.8 (about 15 against 23 ms).
 - **On the CPU** (`pack --no-gpu`), experts are converted to PyTorch's CPU 4-bit format, which multiplies straight from the 4-bit weights. Q4_K converts exactly; Q6_K and Qwen3.8's types are requantized, which adds some error (0.7–7.5% for Qwen3.8's). Packs built earlier (4-bit for the GPU, or Q6_K as int8) still run; the int8 ones print a note asking you to rebuild.
 
 Each expert's gate and up matrices are also fused into one, so computing an expert takes two matrix multiplies instead of three.
@@ -153,7 +153,7 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 These load, but haven't been tested the way the Q4_K_M file above has:
 
-- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ2_S and Q2_0 (Qwen3.8's types) run as they are on the GPU (see above). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
+- **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S and Q2_0 (Qwen3.8's types) run as they are on the GPU (see above). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
 willow only runs GGUF files. The original bf16 safetensors path has been removed; see [ROADMAP.md](ROADMAP.md) for what's coming next.
 

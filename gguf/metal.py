@@ -39,6 +39,13 @@ inline void deq_Q5_0(device const uchar* row, uint c, thread float* v, threadgro
     }
 }
 
+// Q8_0: blocks of 32, 34 bytes: d, then 32 int8 values
+inline void deq_Q8_0(device const uchar* row, uint c, thread float* v, threadgroup const float* kv) {
+    device const uchar* b = row + c * 34;
+    float d = f16_at(b);
+    for (int j = 0; j < 32; j++) v[j] = d * float(as_type<char>(b[2 + j]));
+}
+
 // IQ4_NL: blocks of 32, 18 bytes: d, then 16 bytes of 4-bit indices into kvalues_iq4nl
 inline void deq_IQ4_NL(device const uchar* row, uint c, thread float* v, threadgroup const float* kv) {
     device const uchar* b = row + c * 18;
@@ -101,6 +108,24 @@ inline void deq_IQ2_S(device const uchar* row, uint c, thread float* v, threadgr
         uchar signs = b[34 + g];
         for (int j = 0; j < 8; j++) {
             v[8 * l + j] = dl * float((grid >> (8 * j)) & 0xFF) * ((signs >> j) & 1 ? -1.0f : 1.0f);
+        }
+    }
+}
+
+// IQ3_S: blocks of 256, 110 bytes: d, 64 grid index low bytes, 8 bytes of index 9th bits, 32 sign bytes, then
+// 4 bytes of 4-bit scales (one per 32 values)
+inline void deq_IQ3_S(device const uchar* row, uint c, thread float* v, threadgroup const float* kv) {
+    device const uchar* b = row + (c / 8) * 110;
+    uint ib = c % 8;
+    float d = f16_at(b);
+    float db = d * (1.0f + 2.0f * float((b[106 + ib / 2] >> (4 * (ib % 2))) & 0xF));
+    for (int l = 0; l < 8; l++) {
+        uint g = 8 * ib + l;  // grid index within the block
+        uint grid = iq3s_grid[b[2 + g] | (((b[66 + g / 8] >> (g % 8)) & 1) << 8)];
+        uchar signs = b[74 + g / 2];
+        uint shift = 4 * (g % 2);
+        for (int j = 0; j < 4; j++) {
+            v[4 * l + j] = db * float((grid >> (8 * j)) & 0xFF) * ((signs >> (shift + j)) & 1 ? -1.0f : 1.0f);
         }
     }
 }
@@ -266,7 +291,8 @@ kernel void gemv_combine_NAME(device bfloat* y [[buffer(0)]], device const uchar
 }
 """
 
-TYPES = ("Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ2_S", "Q2_0", "Q4_K", "Q6_K")  # the types these kernels run
+# the types these kernels run
+TYPES = ("Q5_0", "Q8_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ3_S", "IQ2_S", "Q2_0", "Q4_K", "Q6_K")
 
 def _tables() -> str:
     """ggml's lookup tables as Metal constants."""
@@ -274,10 +300,13 @@ def _tables() -> str:
     from .quants import IQ4_NL_LEVELS
     iq3 = bytes.fromhex("".join(iq_grids.IQ3_XXS_GRID))
     iq2 = bytes.fromhex("".join(iq_grids.IQ2_S_GRID))
+    iq3s = bytes.fromhex("".join(iq_grids.IQ3_S_GRID))
     u32 = [int.from_bytes(iq3[i:i + 4], "little") for i in range(0, len(iq3), 4)]
+    u32s = [int.from_bytes(iq3s[i:i + 4], "little") for i in range(0, len(iq3s), 4)]
     u64 = [int.from_bytes(iq2[i:i + 8], "little") for i in range(0, len(iq2), 8)]
     return (f"constant char kvalues_iq4nl[16] = {{{', '.join(str(int(v)) for v in IQ4_NL_LEVELS)}}};\n"
             f"constant uint iq3xxs_grid[{len(u32)}] = {{{', '.join(f'{v:#x}u' for v in u32)}}};\n"
+            f"constant uint iq3s_grid[{len(u32s)}] = {{{', '.join(f'{v:#x}u' for v in u32s)}}};\n"
             f"constant ulong iq2s_grid[{len(u64)}] = {{{', '.join(f'{v:#x}ul' for v in u64)}}};\n")
 
 @functools.cache
