@@ -54,7 +54,7 @@ def hc_step(x, out, gates, norm_w, down, up, inject, hc: int, eps: float):
     return x, mixed, 2 * torch.sigmoid(hc_matmul(xn, inject) / hc)
 
 class Qwen38Engine(GatedDeltaNet, QwenChat, Engine):
-    prefetch_top_k = 10  # Qwen3.8 routes to 10 experts
+    prefetch_top_k = 8  # of the 10 experts Qwen3.8 routes to: guessing all 10 wasted more reads than it saved
     prefix = "model.language_model."
     zero_centered_norm = True
     gdn_output_gate = "sigmoid"

@@ -37,6 +37,10 @@ def add_run_options(command):
     command.add_argument("--min-expert-weight", type=float, default=0.0,
                          help="Skip routed experts below this routing weight, e.g. 0.02 (default: 0, "
                               "off). Faster, but it changes the output and can lower its quality")
+    command.add_argument("--prefetch", type=int, default=None, metavar="N",
+                         help="While decoding, start reading the next layer's N likeliest experts early (default: "
+                              "the model's, 8 for Qwen3.8 and Qwen3.6; 0 turns it off). Fewer wastes fewer "
+                              "reads on wrong guesses, but leaves more reads to wait for")
     command.add_argument("--backbone", choices=("int8", "bf16"), default=None,
                          help="How the non-expert weights are held in memory: int8 (half the memory, slightly less "
                               "precise) or bf16 (default: the model's backbone in models.json, else int8 for "
@@ -94,9 +98,12 @@ def main():
         backbone = args.backbone or entry.get("backbone")
         options = {"backbone": backbone} if backbone else {}
         cache_gb = args.cache_gb if args.cache_gb is not None else entry.get("cache_gb", 0)
-        return load_engine(entry["path"], args.pack_dir or entry.get("pack_dir"), cache_gb, preload=args.preload,
-                           gpu_backbone=args.gpu_backbone, sync_timings=args.sync_timings,
-                           min_expert_weight=args.min_expert_weight, **options)
+        engine = load_engine(entry["path"], args.pack_dir or entry.get("pack_dir"), cache_gb, preload=args.preload,
+                             gpu_backbone=args.gpu_backbone, sync_timings=args.sync_timings,
+                             min_expert_weight=args.min_expert_weight, **options)
+        if args.prefetch is not None:
+            engine.prefetch_top_k = max(0, args.prefetch)
+        return engine
 
     if args.command == "web":
         from web.server import run_web
