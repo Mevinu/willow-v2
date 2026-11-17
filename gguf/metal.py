@@ -17,6 +17,11 @@ import torch.nn.functional as F
 
 from .reader import BLOCK_SIZES
 
+def expert_gate(gate_up: torch.Tensor) -> torch.Tensor:
+    """A routed expert's fused [gate | up] output -> the input of its down matmul."""
+    gate, up = gate_up.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
 MAX_TOKENS = 8  # gemv handles up to this many tokens; more are dequantized to bf16 and multiplied by torch
 ROWS_PER_GROUP = 4  # SIMD groups (rows) per threadgroup
 CHUNK = 32
@@ -353,6 +358,55 @@ def gemv_combine(base: torch.Tensor, type_name: str, shape: tuple, x: torch.Tens
                                                     row_bytes(type_name, k), len(offsets), threads=rows * 32,
                                                     group_size=32 * ROWS_PER_GROUP)
     return y
+
+def decode_experts(x: torch.Tensor, experts: list, loads, weights: torch.Tensor, perm: list, gate,
+                   event=None, tick=None) -> torch.Tensor:
+    """One decode token's routed experts in about three GPU launches instead of a few per expert: gate_up for every
+    expert in a batch at once (gemv_batch; once for the cache hits, then once per group of reads that finish
+    together), the activation over all of them, then down and the routing-weighted sum in one kernel
+    (gemv_combine). experts is sorted, loads is ExpertStore.load_batches' iterator for them, and expert i's routing
+    weight is weights[perm[i]] (bf16, on the GPU). gate is the activation ([experts, 2 * intermediate] ->
+    [experts, intermediate]). Each part is rounded to bf16 as torch's ops would: the sum of p * weight over the
+    experts in order, with p = bf16(W x). event (a torch.mps.Event) is recorded after each batch, and tick(section)
+    is called as time goes to "expert load" and "expert compute". -> bf16 [1, hidden]."""
+    tick = tick or (lambda section: None)
+    x = x.contiguous()  # the kernels index the raw buffers
+    position = {expert: i for i, expert in enumerate(experts)}
+    gate_up = None  # [experts, 2 * intermediate]: row i is expert experts[i]'s gate_up output
+    downs = {}      # expert -> its down weight
+    for batch in loads:
+        tick("expert load")
+        groups = {}  # GPU buffer -> (buffer, [byte offsets], [rows in gate_up]); usually one
+        for expert, (weight, down) in batch:
+            base, offset = weight.location()
+            group = groups.setdefault(base.data_ptr(), (base, [], []))
+            group[1].append(offset)
+            group[2].append(position[expert])
+            downs[expert] = down
+        if gate_up is None:
+            gate_up = torch.empty(len(experts), weight.shape[0], dtype=torch.bfloat16, device=x.device)
+        for base, offsets, rows in groups.values():
+            gemv_batch(base, weight.type_name, weight.shape, x, offsets, rows, gate_up)
+        # torch holds custom kernels (and everything queued before them) until something waits for the GPU, so
+        # without this the GPU would sit idle while the next reads are awaited, then run the whole layer at the
+        # next wait. Recording an event sends the queue to the GPU without waiting (~8 us)
+        if event is not None:
+            event.record()
+        tick("expert compute")
+    hidden = gate(gate_up).contiguous()  # [experts, intermediate]
+    down = downs[experts[0]]
+    located = [downs[expert].location() for expert in experts]
+    if all(base.data_ptr() == located[0][0].data_ptr() for base, _ in located):
+        out = gemv_combine(located[0][0], down.type_name, down.shape, hidden, [o for _, o in located], weights, perm)
+    else:  # the experts' down weights are in different buffers: one at a time, then the same weighted sum
+        outputs = torch.stack([F.linear(hidden[i:i + 1], downs[expert]) for i, expert in enumerate(experts)])
+        scales = weights[torch.tensor(perm, device=weights.device), None, None]
+        parts = (outputs * scales).unbind(0)
+        out = parts[0]
+        for part in parts[1:]:
+            out = out + part
+    tick("expert compute")
+    return out
 
 def dequantize_gpu(raw: torch.Tensor, type_name: str, shape: tuple) -> torch.Tensor:
     """raw (uint8, on the GPU) -> bf16 [rows, k] on the GPU."""

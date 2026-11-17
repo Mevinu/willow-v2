@@ -68,7 +68,7 @@ def build_config(metadata: dict, tensors: dict) -> dict:
 
 def load_engine(gguf_path: str, metadata: dict, tensors: dict, pack_dir: str = None, cache_gb: float = None,
                 preload: bool = True, gpu_backbone: bool = True, sync_timings: bool = False,
-                min_expert_weight: float = 0.0, backbone: str = "int8") -> Qwen38Engine:
+                min_expert_weight: float = 0.0, backbone: str = "int8", remote: str = None) -> Qwen38Engine:
     """See engines/qwen36/loader.py's load_engine for the options. The non-expert weights default to int8: in bf16
     they take 9.2 GiB, too much next to the expert cache on a 16 GB Mac."""
     arch = metadata["general.architecture"]
@@ -78,4 +78,4 @@ def load_engine(gguf_path: str, metadata: dict, tensors: dict, pack_dir: str = N
                            backbone_converter(backbone))
     ple_table = StreamedEmbedding(tensors[PLE_TABLE]) if cfg["ple_layers"] else None
     return build_engine(engine_class, gguf_path, metadata, cfg, weights, pack_dir, cache_gb, preload, gpu_backbone,
-                        sync_timings, min_expert_weight, ple_table=ple_table)
+                        sync_timings, min_expert_weight, remote, ple_table=ple_table)

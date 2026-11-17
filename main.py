@@ -37,6 +37,10 @@ def add_run_options(command):
     command.add_argument("--min-expert-weight", type=float, default=0.0,
                          help="Skip routed experts below this routing weight, e.g. 0.02 (default: 0, "
                               "off). Faster, but it changes the output and can lower its quality")
+    command.add_argument("--remote", metavar="HOST[:PORT]", default=None,
+                         help="A second Mac running `main.py serve-experts` (over a Thunderbolt/USB4 cable): it "
+                              "runs its share of each layer's experts while decoding, reading them from its own "
+                              "SSD. See `split-pack`")
     command.add_argument("--backbone", choices=("int8", "bf16"), default=None,
                          help="How the non-expert weights are held in memory: int8 (half the memory, slightly less "
                               "precise) or bf16 (default: the model's backbone in models.json, else int8 for "
@@ -53,6 +57,23 @@ def main():
     pack.add_argument("--gpu", action=argparse.BooleanOptionalAction, default=None,
                       help="Store the int4 experts in the GPU (MPS) kernel's format so they run on the "
                            "GPU (default: on when torch can use MPS; --no-gpu keeps them on the CPU)")
+
+    split = commands.add_parser("split-pack", help="Write a second Mac's share of a model's experts, for "
+                                                   "`serve-experts` there")
+    split.add_argument("model", help=MODEL_HELP)
+    split.add_argument("--out-dir", required=True, help="Where to write it (then copy that folder to the other Mac)")
+    split.add_argument("--share", type=float, default=0.33,
+                       help="The other Mac's share of each layer's expert reads, by the usage table (default: 0.33, "
+                            "for an SSD half as fast as this one)")
+    split.add_argument("--pack-dir", default=None, help="This Mac's pack (default: as for `run`)")
+
+    serve = commands.add_parser("serve-experts", help="Run a split pack's experts for another Mac's `--remote`")
+    serve.add_argument("pack_dir", help="The folder `split-pack` wrote, copied to this Mac")
+    serve.add_argument("--cache-gb", type=float, default=3,
+                       help="GiB of RAM for caching experts here (default: 3, for an 8 GB Mac)")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.add_argument("--bind", default="0.0.0.0", help="Address to listen on (default: all)")
+    serve.add_argument("--no-preload", action="store_true", help="Don't read the most used experts in first")
 
     run = commands.add_parser("run", help="Generate text from a prompt, streaming experts from the pack")
     run.add_argument("model", help=MODEL_HELP)
@@ -78,12 +99,22 @@ def main():
     web.add_argument("--no-browser", action="store_true", help="Don't open the page in a browser")
     args = parser.parse_args()
 
+    if args.command == "serve-experts":  # needs no model: only the split pack
+        from gguf.remote import ExpertServer
+        ExpertServer(args.pack_dir, args.cache_gb, not args.no_preload).serve(args.bind, args.port)
+        return
+
     models, default = read_models()
     entry = resolve(args.model, models, default)
     check_gguf(entry["path"])
     if args.command == "pack":
         from gguf.compiler import compile_pack
         compile_pack(entry["path"], args.out_dir or entry.get("pack_dir"), args.gpu)
+        return
+    if args.command == "split-pack":
+        from gguf.compiler import default_pack_dir
+        from gguf.remote import split_pack
+        split_pack(args.pack_dir or entry.get("pack_dir") or default_pack_dir(entry["path"]), args.out_dir, args.share)
         return
 
     from engines import load_engine
@@ -96,7 +127,7 @@ def main():
         cache_gb = args.cache_gb if args.cache_gb is not None else entry.get("cache_gb", 0)
         return load_engine(entry["path"], args.pack_dir or entry.get("pack_dir"), cache_gb, preload=args.preload,
                            gpu_backbone=args.gpu_backbone, sync_timings=args.sync_timings,
-                           min_expert_weight=args.min_expert_weight, **options)
+                           min_expert_weight=args.min_expert_weight, remote=args.remote, **options)
 
     if args.command == "web":
         from web.server import run_web

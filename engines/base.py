@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from gguf import metal
+from gguf.metal import expert_gate  # defined there so the expert server needn't import the engine
 from gguf.store import ExpertStore
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -95,11 +96,6 @@ def route(router_logits: torch.Tensor, top_k: int, normalize: bool):
     if normalize:
         routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
     return routing_weights.to(router_logits.dtype), selected
-
-def expert_gate(gate_up: torch.Tensor) -> torch.Tensor:
-    """A routed expert's fused [gate | up] output -> the input of its down matmul."""
-    gate, up = gate_up.chunk(2, dim=-1)
-    return F.silu(gate) * up
 
 def shared_expert(x, gate_w, up_w, down_w, shared_gate_w) -> torch.Tensor:
     """Qwen2-MoE / Qwen3.5-MoE: a dense MLP every token uses, scaled by a sigmoid gate."""
@@ -244,6 +240,7 @@ class Engine:
         # WILLOW_BATCHED_EXPERTS=0 runs them one at a time instead, for comparison
         self.batched_experts = os.environ.get("WILLOW_BATCHED_EXPERTS", "1") != "0"
         self.gpu_event = torch.mps.Event() if self.device.type == "mps" else None  # see batched_decode_experts
+        self.remote = None  # a second Mac running part of each layer's experts (gguf.remote.RemoteExperts)
         if self.device.type != "cpu":
             moved = {}  # tied tensors (lm_head = embed_tokens) are moved once
             for name in list(weights):
@@ -468,15 +465,18 @@ class Engine:
         fast_decode = self.ops.compiled and self.ops.decoding
         batched = (fast_decode and self.batched_experts and x.shape[0] == 1 and x.dtype == torch.bfloat16
                    and routing_weights.dtype == torch.bfloat16 and self.experts.runs_batched(layer))
-        # Start this layer's reads first, so the guesses for the next layer queue up behind them
-        loads = (self.experts.load_batches if batched else self.experts.load_many)(layer, experts)
-        if guess is not None:
-            self.experts.prefetch(layer + 1, guess)
-        t = self.tick("read setup", t)
-        if batched:
-            out = self.batched_decode_experts(x, experts, loads, selected, routing_weights, t)
+        if batched and self.remote is not None and self.remote.alive:
+            out = self.split_decode_experts(x, layer, experts, guess, selected, routing_weights, t)
         else:
-            out = self.each_expert(x, loads, selected, routing_weights, t)
+            # Start this layer's reads first, so the guesses for the next layer queue up behind them
+            loads = (self.experts.load_batches if batched else self.experts.load_many)(layer, experts)
+            if guess is not None:
+                self.experts.prefetch(layer + 1, guess)
+            t = self.tick("read setup", t)
+            if batched:
+                out = self.batched_decode_experts(x, experts, loads, selected, routing_weights, t)
+            else:
+                out = self.each_expert(x, loads, selected, routing_weights, t)
 
         sp = p + ".shared_expert"
         if sp + ".gate_proj.weight" in self.weights:
@@ -495,41 +495,66 @@ class Engine:
         bf16 result as combine_decode_experts: gate_up for every expert in a batch at once (metal.gemv_batch; once
         for the cache hits, then once per group of reads that finish together), the activation over all of them,
         then down and the routing-weighted sum in one kernel (metal.gemv_combine). experts is sorted, and loads
-        is ExpertStore.load_batches' iterator for them."""
-        x = x.contiguous()  # the kernels index the raw buffers
-        position = {expert: i for i, expert in enumerate(experts)}
-        gate_up = None  # [experts, 2 * intermediate]: row i is expert experts[i]'s gate_up output
-        downs = {}      # expert -> its down weight
-        for batch in loads:
-            t = self.tick("expert load", t)
-            groups = {}  # GPU buffer -> (buffer, [byte offsets], [rows in gate_up]); usually one
-            for expert, (weight, down) in batch:
-                base, offset = weight.location()
-                group = groups.setdefault(base.data_ptr(), (base, [], []))
-                group[1].append(offset)
-                group[2].append(position[expert])
-                downs[expert] = down
-            if gate_up is None:
-                gate_up = torch.empty(len(experts), weight.shape[0], dtype=torch.bfloat16, device=x.device)
-            for base, offsets, rows in groups.values():
-                metal.gemv_batch(base, weight.type_name, weight.shape, x, offsets, rows, gate_up)
-            # torch holds custom kernels (and everything queued before them) until something waits for the GPU,
-            # so without this the GPU would sit idle while the next reads are awaited, then run the whole layer
-            # at the next wait. Recording an event sends the queue to the GPU without waiting (~8 us)
-            self.gpu_event.record()
-            t = self.tick("expert compute", t)
-        hidden = self.ops.expert_gate(gate_up).contiguous()  # [experts, intermediate]
-        down = downs[experts[0]]
-        located = [downs[expert].location() for expert in experts]
-        if all(base.data_ptr() == located[0][0].data_ptr() for base, _ in located):
-            slots = selected[0].tolist()  # where each expert's routing weight is
-            out = metal.gemv_combine(located[0][0], down.type_name, down.shape, hidden, [o for _, o in located],
-                                     routing_weights[0], [slots.index(expert) for expert in experts])
-        else:  # the experts' down weights are in different buffers: run them one at a time
-            outputs = {expert: F.linear(hidden[i:i + 1], downs[expert]) for i, expert in enumerate(experts)}
-            out = self.combine_decode_experts(outputs, selected, routing_weights)
-        self.tick("expert compute", t)
+        is ExpertStore.load_batches' iterator for them. See metal.decode_experts, which the second Mac's expert
+        server (gguf/remote.py) runs too."""
+        clock = [t]
+
+        def tick(section: str):
+            clock[0] = self.tick(section, clock[0])
+        slots = selected[0].tolist()  # where each expert's routing weight is
+        out = metal.decode_experts(x, experts, loads, routing_weights[0], [slots.index(expert) for expert in experts],
+                                   self.ops.expert_gate, self.gpu_event, tick)
         return out.view_as(x)
+
+    def split_decode_experts(self, x: torch.Tensor, layer: int, experts: list, guess, selected: torch.Tensor,
+                             routing_weights: torch.Tensor, t: float) -> torch.Tensor:
+        """batched_decode_experts, with the experts (and next-layer guesses) the second Mac holds run there: they're
+        sent before this Mac starts its own reads, so both SSDs read at once, and the second Mac's weighted sum is
+        added at the end. If the second Mac fails, every expert runs here from then on (this Mac's pack has them
+        all)."""
+        remote = self.remote
+        owned = remote.owned[layer]
+        theirs = [expert for expert in experts if expert in owned]
+        mine = [expert for expert in experts if expert not in owned]
+        following = remote.owned[layer + 1] if layer + 1 < self.num_layers else set()
+        their_guess = [expert for expert in guess or () if expert in following]
+        my_guess = [expert for expert in guess or () if expert not in following]
+        if theirs or their_guess:
+            try:
+                slots = selected[0].tolist()
+                bits = routing_weights[0].cpu().view(torch.int16).tolist() if theirs else []
+                remote.send(layer, theirs, [bits[slots.index(expert)] for expert in theirs], their_guess,
+                            x.cpu() if theirs else None)
+            except OSError as error:
+                self.drop_remote(error)
+                theirs, mine, my_guess = [], experts, list(guess or ())
+        loads = self.experts.load_batches(layer, mine) if mine else None
+        if my_guess:
+            self.experts.prefetch(layer + 1, my_guess)
+        t = self.tick("read setup", t)
+        out = self.batched_decode_experts(x, mine, loads, selected, routing_weights, t) if mine else None
+        if theirs:
+            t = time.perf_counter()
+            try:
+                theirs_out = remote.receive()
+                self.keep_alive.append(theirs_out)  # copied without waiting
+                theirs_out = theirs_out.to(x.device, non_blocking=True).view_as(x)
+            except (OSError, RuntimeError) as error:
+                # A dropped connection, or an error on the other Mac (which it can't be counted on to recover from)
+                self.drop_remote(error)
+                # Run them here: wait for the GPU first, since reading them may reuse the slots of mine
+                torch.mps.synchronize()
+                theirs_out = self.batched_decode_experts(x, theirs, self.experts.load_batches(layer, theirs),
+                                                         selected, routing_weights, t)
+            self.tick("remote experts", t)
+            out = theirs_out if out is None else out + theirs_out
+        return out
+
+    def drop_remote(self, error: Exception):
+        """The second Mac has gone away: every expert runs here from now on, and its experts can be in the hot set
+        again (see ExpertStore.set_remote)."""
+        self.remote.fail(error)
+        self.experts.set_remote([])
 
     def each_expert(self, x: torch.Tensor, loads, selected: torch.Tensor, routing_weights: torch.Tensor,
                     t: float) -> torch.Tensor:

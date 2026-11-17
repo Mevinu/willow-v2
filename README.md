@@ -115,6 +115,21 @@ Decoding is greedy: it always picks the most likely next token.
 | `--out-dir DIR` | `<name>.expert_pack` | Where to write the pack. |
 | `--gpu` / `--no-gpu` | on when PyTorch can use MPS | Keep the experts in their GGUF formats, which run on the GPU. `--no-gpu` converts them to 4 bits for the CPU. |
 
+### A second Mac
+
+Decoding is limited by how fast experts come off the SSD (Qwen3.8 reads about 1.2 GiB per token). A second Mac, connected by a Thunderbolt or USB4 cable, adds its own SSD: it holds part of each layer's experts and runs them itself, so only the token's hidden state and the result (about 10 KB out and 5 KB back per layer) cross the cable. Wi-Fi is too slow for this (a round trip there takes milliseconds; over the cable, about 0.1 ms).
+
+```bash
+# On this Mac: write the other Mac's share (by the usage table, so run the model a few times first)
+.venv/bin/python main.py split-pack Qwen3.8 --out-dir ~/Models/Qwen3.8-M1.expert_pack --share 0.33
+# Copy that folder (and willow) to the other Mac, then there:
+.venv/bin/python main.py serve-experts ~/Models/Qwen3.8-M1.expert_pack --cache-gb 3
+# Back here, with the address serve-experts prints (169.254.x.x, the cable):
+.venv/bin/python main.py chat Qwen3.8 --remote 169.254.x.x
+```
+
+`--share` is the other Mac's part of each layer's expert reads: about its SSD's speed over both SSDs' (0.33 for an M1 13" Pro's 3.2 GiB/s next to 6.5). At each layer of a decode step, this Mac sends the other its experts (with their routing weights) and its share of the next layer's guesses, then reads and runs its own while the other does the same, and adds the other's routing-weighted sum to its own. This Mac keeps the whole pack, so prefill runs here as before, and if the other Mac goes away, every expert runs here from then on. The stats show how many experts ran there, and `remote experts` in the decode times is how long this Mac waited for its answers. The two halves are summed separately, which can change the last bf16 bit, so greedy output can drift from a one-Mac run after a while. `bench/two_macs.py` measures what this depends on (each SSD's speed, and the cable's round trips) before setting it up. The code is `gguf/remote.py`.
+
 ## How it works
 
 The model won't fit in 16 GB of RAM. Most of its size is in the **experts**: 40 layers × 256 experts. For each token, a small router in each layer picks just 8 of its 256 experts, so only a small slice of them is needed at any moment.
@@ -165,6 +180,7 @@ willow only runs GGUF files. The original bf16 safetensors path has been removed
 - `model_list.py`: reads `models.json` and turns a model's name into its path and settings.
 - `runner.py`: the terminal side of `run` and `chat`: streaming the reply and printing the stats.
 - `terminal_markdown.py`: shows the model's Markdown as styled terminal text while it streams.
+- `gguf/remote.py`: running part of each layer's experts on a second Mac (`split-pack`, `serve-experts`, `--remote`).
 - `web_tools.py`: `chat --browse`'s tools (web search and page reading), and parsing the model's tool calls.
 - `chat_screen.py`: `chat`'s full-window layout (the live status line and input box), with plain ANSI escape codes.
 - `gguf/`: everything about the file format, shared by every model: the GGUF file reader (`reader.py`); dequantization (with the IQ grids in `iq_grids.py`), the Q4_K/Q6_K pack formats and the CPU and GPU 4-bit kernels (`quants.py`); Metal kernels that run Qwen3.8's ggml types as they are (`metal.py`); the shared CPU/GPU memory helper (`mps_shared.py`, `mps_shared.mm`); the expert-pack compiler (`compiler.py`); the expert store that streams experts from the pack, with its cache, usage table and preload (`store.py`); the tokenizer rebuilt from the GGUF's vocabulary (`tokenizer.py`); and tables read row by row from the GGUF instead of loaded (`streamed.py`).

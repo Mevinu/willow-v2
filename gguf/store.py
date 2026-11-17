@@ -121,6 +121,10 @@ class ExpertStore:
         self.in_use = set()  # (layer, expert) the GPU may still be computing with (GPU slabs only)
         self.slabs = {}  # layer -> its slab group (shared by layers with the same slot layout)
         self.hot = set()  # (layer, expert) the slabs keep for as long as they can (see choose_hot)
+        # A pack split by `main.py split-pack` holds some of each layer's experts (see remote.py)
+        self.held = [sorted(int(key.split("_")[1]) for key in self.manifest["experts"]
+                            if int(key.split("_")[0]) == layer) for layer in range(self.manifest["num_layers"])]
+        self.elsewhere = set()  # (layer, expert) another Mac runs while decoding (see set_remote)
         if cache_bytes or self.gpu:
             self.build_slabs(cache_bytes)
         self.load_usage(pack_dir)
@@ -284,12 +288,11 @@ class ExpertStore:
     # Slabs
 
     def build_slabs(self, cache_bytes: int):
-        num_experts = self.manifest["num_experts"]
         self.slot_parts = {}  # layer -> {part: (offset in slot, size in slot)}
         self.direct = {}      # layer -> whether its slot is a byte-for-byte copy of the pack block
         layouts = {}          # (direct, slot size) -> layers
         for layer in range(self.manifest["num_layers"]):
-            entries = [self.manifest["experts"][f"{layer}_{e}"] for e in range(num_experts)]
+            entries = [self.manifest["experts"][f"{layer}_{e}"] for e in self.held[layer]]
             parts, offset = {}, 0
             for name in entries[0]["parts"]:
                 shape, type_name = self.parts[f"{layer}.{name}"]
@@ -467,17 +470,32 @@ class ExpertStore:
         self.hot = set()
         if not self.usage_runs:
             return
+        usage = self.usage.clone()
+        for layer, expert in self.elsewhere:  # never read here while decoding, so not worth a slot
+            usage[layer, expert] = 0
+        for layer in range(usage.shape[0]):  # a split pack can't read experts it doesn't hold
+            missing = torch.ones(usage.shape[1], dtype=torch.bool)
+            missing[self.held[layer]] = False
+            usage[layer, missing] = 0
         for group in {id(g): g for g in self.slabs.values()}.values():
             slots = len(group["free"]) + len(group["lru"]) + len(group["hot_lru"])
             room = min(int(slots * HOT_SHARE), slots - GPU_SLAB_MIN)
             if room <= 0:
                 continue
             layers = group["layers"]
-            counts = self.usage[layers].flatten()
+            counts = usage[layers].flatten()
             top = counts.topk(min(room, counts.numel()))
             num_experts = self.usage.shape[1]
             self.hot.update((layers[i // num_experts], i % num_experts)
                             for i, used in zip(top.indices.tolist(), top.values.tolist()) if used)
+
+    def set_remote(self, owned: list):
+        """owned[layer]: the experts another Mac runs while decoding (see remote.py). This Mac still holds and can
+        run them (prefill, or if the other Mac goes away), but doesn't keep them in its hot set. Call before
+        preload."""
+        self.elsewhere = {(layer, expert) for layer, experts in enumerate(owned) for expert in experts}
+        if self.slabs:
+            self.choose_hot()
 
     def record_usage(self, layer: int, selected: torch.Tensor):
         """Called by the engine with the experts each token was routed to."""
@@ -513,11 +531,11 @@ class ExpertStore:
                 reads.append((key, *self.start_read(*key)))
         else:  # the plain LRU: fit every layer's share, by its largest expert
             layer_bytes = sum(max(self.manifest["experts"][f"{layer}_{e}"]["read_length"]
-                                  for e in range(self.usage.shape[1])) for layer in range(self.usage.shape[0]))
+                                  for e in self.held[layer]) for layer in range(self.usage.shape[0]))
             count = min(int(self.usage.shape[1] * fraction), self.cache_bytes // layer_bytes)
             for layer in range(self.usage.shape[0]):
                 for expert, used in reversed(self.most_used(layer, count)):
-                    if used:
+                    if used and f"{layer}_{expert}" in self.manifest["experts"]:
                         reads.append(((layer, expert), *self.start_read(layer, expert)))
         loaded = len(reads)
         while reads:  # popped as they are used, so read blocks aren't kept alive by their futures

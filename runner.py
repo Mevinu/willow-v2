@@ -217,6 +217,10 @@ def print_stats(engine, load_seconds: float):
     cache = engine.experts
     print(f"cache:    {cache.cached_bytes / 1024**3:.2f} / {cache.cache_bytes / 1024**3:.2f} GiB used, "
           f"{len(cache.cache)} experts held")
+    remote = getattr(engine, "remote", None)
+    if remote is not None:
+        state = "connected" if remote.alive else "lost (every expert ran here after that)"
+        print(f"remote:   {remote.experts_sent} experts ran on {remote.address} ({state})")
     if engine.experts_routed:
         print(f"skipped:  {engine.experts_skipped} of {engine.experts_routed} routed experts while decoding "
               f"({engine.experts_skipped / engine.experts_routed * 100:.0f}%), weight below {engine.min_expert_weight}")

@@ -235,24 +235,25 @@ def load_weights(arch: str, prefix: str, cfg: dict, tensors: dict, layer_names: 
 
 def load_engine(gguf_path: str, metadata: dict, tensors: dict, pack_dir: str = None, cache_gb: float = None,
                 preload: bool = True, gpu_backbone: bool = True, sync_timings: bool = False,
-                min_expert_weight: float = 0.0, backbone: str = "bf16") -> MoEEngine:
+                min_expert_weight: float = 0.0, backbone: str = "bf16", remote: str = None) -> MoEEngine:
     """metadata and tensors are the GGUF's header (gguf.reader.read_gguf). cache_gb None or 0 (no --cache-gb) turns
     the expert cache off. preload reads the most used experts into the cache first (see ExpertStore.preload). With
     a GPU pack, gpu_backbone also runs everything else (attention, the router, the shared expert, the output layer)
     on the GPU. sync_timings makes the per-section decode times real when the GPU is used, at some cost in speed
     (see MoEEngine.tick). min_expert_weight skips routed experts below that weight (see
     MoEEngine.skip_small_experts). backbone is how the non-expert weights are held: "bf16" or "int8" (see
-    backbone_converter)."""
+    backbone_converter). remote is a second Mac's expert server, "HOST[:PORT]", that runs part of each layer's
+    experts while decoding (see gguf/remote.py)."""
     arch = metadata["general.architecture"]
     engine_class = ARCHITECTURES[arch]
     cfg = build_config(metadata, tensors)
     weights = load_weights(arch, engine_class.prefix, cfg, tensors, convert=backbone_converter(backbone))
     return build_engine(engine_class, gguf_path, metadata, cfg, weights, pack_dir, cache_gb, preload, gpu_backbone,
-                        sync_timings, min_expert_weight)
+                        sync_timings, min_expert_weight, remote)
 
 def build_engine(engine_class, gguf_path: str, metadata: dict, cfg: dict, weights: dict, pack_dir: str,
                  cache_gb: float, preload: bool, gpu_backbone: bool, sync_timings: bool, min_expert_weight: float,
-                 **engine_options):
+                 remote: str = None, **engine_options):
     """The part of loading that every Qwen GGUF shares: the tokenizer and end tokens, the expert store, the device,
     and the engine itself (engine_options are passed on to its constructor)."""
     tokenizer = build_tokenizer(metadata)
@@ -262,11 +263,23 @@ def build_engine(engine_class, gguf_path: str, metadata: dict, cfg: dict, weight
     cfg["bos_token_id"] = metadata.get("tokenizer.ggml.bos_token_id", vocab.get("<|endoftext|>"))
 
     experts = ExpertStore(pack_dir or default_pack_dir(gguf_path), int((cache_gb or 0) * 1024**3))
+    client = None
+    if remote:
+        from gguf.remote import RemoteExperts
+        try:
+            client = RemoteExperts(remote, experts.manifest)
+        except (OSError, ValueError) as error:  # not running, not reachable, or serving another model
+            print(f"note: can't use the expert server at {remote} ({error}); running every expert here")
+        else:
+            experts.set_remote([sorted(owned) for owned in client.owned])  # before preload: see set_remote
+            share = sum(map(len, client.owned)) / (experts.manifest["num_layers"] * experts.manifest["num_experts"])
+            print(f"expert server at {client.address}: it runs {share * 100:.0f}% of the experts while decoding")
     if preload:
         experts.preload()
     device = "mps" if experts.gpu and gpu_backbone else "cpu"
     engine = engine_class(cfg, eos_ids, weights, experts, tokenizer, device, **engine_options)
     engine.sync_timings = sync_timings
     engine.min_expert_weight = min_expert_weight
+    engine.remote = client
     print(f"experts on the {'GPU' if experts.gpu else 'CPU'}, the rest on the {'GPU' if device == 'mps' else 'CPU'}")
     return engine
