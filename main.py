@@ -37,6 +37,11 @@ def add_run_options(command):
     command.add_argument("--min-expert-weight", type=float, default=0.0,
                          help="Skip routed experts below this routing weight, e.g. 0.02 (default: 0, "
                               "off). Faster, but it changes the output and can lower its quality")
+    command.add_argument("--experts", type=int, default=None, metavar="K",
+                         help="Route each token to only its K highest-weighted experts per layer instead of the "
+                              "model's own number (10 for Qwen3.8, 8 for Qwen3.6), their weights rescaled to sum to "
+                              "1. Fewer reads each token, so faster, but it changes the output and can lower its "
+                              "quality")
     command.add_argument("--prefetch", type=int, default=None, metavar="N",
                          help="While decoding, start reading the next layer's N likeliest experts early (default: "
                               "the model's, 8 for Qwen3.8 and Qwen3.6; 0 turns it off). Fewer wastes fewer "
@@ -101,8 +106,14 @@ def main():
         engine = load_engine(entry["path"], args.pack_dir or entry.get("pack_dir"), cache_gb, preload=args.preload,
                              gpu_backbone=args.gpu_backbone, sync_timings=args.sync_timings,
                              min_expert_weight=args.min_expert_weight, **options)
+        if args.experts is not None:
+            if not 1 <= args.experts <= engine.top_k:
+                raise SystemExit(f"--experts must be from 1 to {engine.top_k} for this model")
+            engine.top_k = args.experts
+            engine.norm_topk_prob = True  # the kept experts' weights still add up to 1
         if args.prefetch is not None:
             engine.prefetch_top_k = max(0, args.prefetch)
+        engine.prefetch_top_k = min(engine.prefetch_top_k, engine.top_k)  # guessing more than are used wastes reads
         return engine
 
     if args.command == "web":
