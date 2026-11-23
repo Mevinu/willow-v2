@@ -9,7 +9,7 @@
 
 Why it's interesting: most "run big models locally" tools need the whole model in memory. willow treats a mixture-of-experts model as what it is, a large library of mostly idle experts, and reads only the ones it needs from disk for each token.
 
-> **Heads up:** this is a vibe-coded proof of concept. It's only been tested on a Mac (M5 MacBook Pro, 16 GB RAM), with one GGUF file. I don't know how well it works on Linux or Windows. Expect rough edges, and see [ROADMAP.md](ROADMAP.md) for what's planned next.
+> **Heads up:** this is a vibe-coded proof of concept. It's only been tested on a Mac (M5 MacBook Pro, 16 GB RAM), with two GGUF files (Qwen3.6 and Qwen3.8). I don't know how well it works on Linux or Windows. Expect rough edges, and see [ROADMAP.md](ROADMAP.md) for what's planned next.
 
 **Measured on an M5 MacBook Pro (16 GB):** in `main.py chat` with Qwen3.6-35B-A3B (Q4_K_M), a 893-token reply ran at about 10 tokens/s on average, while Activity Monitor showed roughly 13–14 GB of memory in use.
 
@@ -29,7 +29,7 @@ Everything here is built, tuned and tested against one file:
 - **Q4_K_M** quantization, which mixes **Q4_K** and **Q6_K** tensors. Those are exactly the two types willow has fast paths for (see [How the GGUF is run](#how-the-gguf-is-run)).
 - Text only: the vision encoder and multi-token-prediction head aren't used.
 
-Other GGUFs of the same architecture should work the same way, but this is the only one that has actually been run. See [Other models and formats](#other-models-and-formats).
+willow has also been run on [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (`Qwen3.8-Flash-Next-UD-IQ4_XS`, 4 split files), with a 2 GiB expert cache, at about 5 tokens/s. The design is described in [ROADMAP.md](ROADMAP.md). Other GGUFs of these architectures should work the same way, but those two are the only ones that have actually been run. See [Other models and formats](#other-models-and-formats).
 
 ## Quick start
 
@@ -167,7 +167,11 @@ Each run also keeps a **usage table**: how many tokens each expert in each layer
 
 ## Other models and formats
 
-These load, but haven't been tested the way the Q4_K_M file above has:
+Tested, but less than the Q4_K_M file above:
+
+- **Qwen3.8-Flash-Next** (`Qwen3.8-Flash-Next-UD-IQ4_XS`, 4 split files), run with `--cache-gb 2`, at about 5 tokens/s. Pass any one of the split files.
+
+These load, but haven't been tested:
 
 - **Other GGUFs** of the `qwen35moe` or `qwen3moe` (the older Qwen3-MoE) architectures, single or split (pass any one of the split files). Supported quant types: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q2_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S. In the experts, Q5_0, IQ4_NL, IQ4_XS, IQ3_XXS, IQ3_S, IQ2_S and Q2_0 (Qwen3.8's types) run as they are on the GPU (see above). Any other type is copied into the pack byte for byte and dequantized as each expert is read, which is slower.
 
