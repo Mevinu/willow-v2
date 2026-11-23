@@ -29,7 +29,7 @@ Everything here is built, tuned and tested against one file:
 - **Q4_K_M** quantization, which mixes **Q4_K** and **Q6_K** tensors. Those are exactly the two types willow has fast paths for (see [How the GGUF is run](#how-the-gguf-is-run)).
 - Text only: the vision encoder and multi-token-prediction head aren't used.
 
-willow has also been run on [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (`Qwen3.8-Flash-Next-UD-IQ4_XS`, 4 split files), with a 2 GiB expert cache, at about 5 tokens/s (4.7 tokens/s average over a 62-token reply in `main.py chat`). The design is described in [ROADMAP.md](ROADMAP.md). Other GGUFs of these architectures should work the same way, but those two are the only ones that have actually been run. See [Other models and formats](#other-models-and-formats).
+willow has also been run on [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (`Qwen3.8-Flash-Next-UD-IQ4_XS`, 4 split files), with a 2 GiB expert cache, at about 5 tokens/s (4.7 tokens/s average over a 62-token reply in `main.py chat`, and 5.0 tokens/s average over a 194-token reply). On the same M5 with 16 GB, the Python process used about 8.8 GB, the system had about 15 GB in use, and about 6.9 GB was swapped out. It runs, but the machine is short on memory, so close other apps first. The design is described in [ROADMAP.md](ROADMAP.md). Other GGUFs of these architectures should work the same way, but those two are the only ones that have actually been run. See [Other models and formats](#other-models-and-formats).
 
 ## Quick start
 
