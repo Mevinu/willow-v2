@@ -11,7 +11,7 @@ Why it's interesting: most "run big models locally" tools need the whole model i
 
 > **Heads up:** this is a vibe-coded proof of concept. It's only been tested on a Mac (M5 MacBook Pro, 16 GB RAM), with one GGUF file. I don't know how well it works on Linux or Windows. Expect rough edges, and see [ROADMAP.md](ROADMAP.md) for what's planned next.
 
-<!-- TODO(author): add a 10-second terminal recording (asciinema or GIF) of `main.py chat` showing live tokens/s here, plus your measured tokens/s on the M5. -->
+**Measured on an M5 MacBook Pro (16 GB):** in `main.py chat` with Qwen3.6-35B-A3B (Q4_K_M), a 893-token reply ran at about 10 tokens/s on average, while Activity Monitor showed roughly 13–14 GB of memory in use.
 
 ## Contents
 
