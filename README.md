@@ -1,8 +1,22 @@
 # willow
 
-Run **Qwen3.6-35B-A3B** as a Q4_K_M GGUF on a 16 GB laptop, by keeping the model's experts on the SSD and streaming in only the ones each token needs.
+**Run a 35-billion-parameter language model on a 16 GB laptop.** willow keeps the model's experts on the SSD and streams in only the ~8 of 256 that each token actually needs, so a model far bigger than your RAM still runs locally, with no cloud and no GPU server.
 
-> **Heads up:** this is a vibe-coded proof of concept. It's only been tested on a Mac (M5 MacBook Pro, 16 GB RAM), with one GGUF file. I don't know how well it works on Linux or Windows.
+- **Model:** Qwen3.6-35B-A3B, Q4_K_M GGUF (about 20 GB on disk)
+- **Hardware it's built for:** Apple Silicon Macs with 16 GB of RAM (Metal GPU path included)
+- **Interfaces:** a terminal chat, a one-shot `run` command, and a local web chat page
+- **Dependencies:** Python 3.9+ and PyTorch; the web page and web browsing use only the standard library
+
+Why it's interesting: most "run big models locally" tools need the whole model in memory. willow treats a mixture-of-experts model as what it is, a large library of mostly idle experts, and reads only the ones it needs from disk for each token.
+
+> **Heads up:** this is a vibe-coded proof of concept. It's only been tested on a Mac (M5 MacBook Pro, 16 GB RAM), with one GGUF file. I don't know how well it works on Linux or Windows. Expect rough edges, and see [ROADMAP.md](ROADMAP.md) for what's planned next.
+
+**Measured on an M5 MacBook Pro (16 GB):** in `main.py chat` with Qwen3.6-35B-A3B (Q4_K_M), a 893-token reply ran at about 10 tokens/s on average, while Activity Monitor showed roughly 13–14 GB of memory in use.
+
+## Contents
+
+- [Quick start](#quick-start) · [Commands](#commands) · [How it works](#how-it-works)
+- [Other models and formats](#other-models-and-formats) · [Project layout](#project-layout) · [Contributing](CONTRIBUTING.md)
 
 ## The model under test
 
